@@ -7,7 +7,9 @@ Ensuite tu poses tes rushs bruts dans un dossier, tu dis en une phrase ce que tu
 vidéo montée **comme tu l'aurais montée** — prête à poster, plus un fichier pour la retoucher dans Premiere,
 Final Cut ou DaVinci.
 
-Pensé pour les reels / TikTok / Shorts face caméra, en vertical (9:16). Français et autres langues.
+Pensé pour les reels / TikTok / Shorts en vertical (9:16) : **face caméra**, ou **voix off posée sur tes rushs**
+(il choisit pour chaque phrase le plan qui l'illustre, au rythme de tes vidéos). Français et autres langues.
+Fonctionne avec un abonnement Claude Pro (20 $/mois) : le gros du travail tourne sur ton ordinateur.
 
 ## Ce qu'il fait pour toi
 - garde ta meilleure prise de chaque phrase, enlève les ratés, les « euh » et les blancs — en gardant **ta**
@@ -21,7 +23,8 @@ Pensé pour les reels / TikTok / Shorts face caméra, en vertical (9:16). Franç
 - retient tes corrections : dis « trop de zooms » une fois, il s'en souvient pour les prochaines.
 
 ## Ce qui est reproduit exactement, ce qui est approché
-**Mesuré sur tes vidéos et vérifié sur chaque montage** : rythme des coupes, longueur des plans, plus long
+**Mesuré sur tes vidéos et vérifié sur chaque montage** : rythme des coupes, longueur des plans (leur
+répartition courts / longs, et le rythme plus rapide de ton accroche), cadrage de ton visage, plus long
 silence, pauses dans et entre les phrases, nombre et type de zooms (poussée lente, punch-in, crash zoom) et leur
 vitesse, taille et position des sous-titres, couleur du texte et du mot-clé, emojis par minute, part et durée
 des b-roll, bruitages par minute, volume de la voix et de la musique, luminosité / contraste / saturation /
@@ -65,6 +68,12 @@ seulement si ton style change.
 `musique/`), puis dis par exemple :
 > Monte ma vidéo sur les 3 erreurs en salle de sport, 45 secondes, ton motivant.
 
+**Voix off** : mets ta voix (fichier son) dans `voix/` et tes plans filmés dans `rushs/`, puis dis
+> Monte ma voix off sur mes rushs.
+
+Il regarde tous tes plans, découpe ta voix au rythme de ta DA et pose sur chaque passage le plan qui colle à ce
+que tu dis (le café quand tu parles du café), sans jamais réutiliser le même plan ni laisser d'écran noir.
+
 Tu peux aussi donner ta trame (« d'abord le problème, puis mes 3 conseils, finis sur abonne-toi »). Il te
 montre le plan ; tu valides ou tu dis « enlève la 2e phrase ». Pressé ? Ajoute « vas-y direct ». La vidéo
 arrive dans `sorties/`.
@@ -90,7 +99,7 @@ clé, aucun service en plus : rien de plus que ton abonnement Claude. Tous les o
 gratuits.
 
 ## Limites
-- Fait pour les vidéos face caméra courtes (moins de ~3 min). Pas de vlog multi-caméra, pas d'effets 3D ni
+- Fait pour les vidéos courtes (moins de ~3 min), face caméra ou voix off. Pas de vlog multi-caméra, pas d'effets 3D ni
   de motion design (sous-titres : pop, rebond, glissé, fondu, karaoké, mot par mot, surlignage), pas de
   transitions élaborées.
 - Les bruitages (whoosh…) ne s'entendent pas de façon fiable sous la voix : il te demande si tu en mets.

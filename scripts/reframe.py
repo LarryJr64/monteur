@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import ffmpeg, probe  # noqa: E402
+from common import ffmpeg, probe, tonemap  # noqa: E402
 
 MODEL_NAME = "face_detection_yunet_2023mar.onnx"
 # opencv_zoo, licence MIT (models/face_detection_yunet/LICENSE, Shiqi Yu) — vérifiée le 05/11/2026
@@ -29,6 +29,9 @@ RATE = 8            # détections par seconde (5-10 suffisent pour une tête qui
 DET_W = 320         # largeur d'analyse : un visage qui parle y fait encore 30-100 px, YuNet le voit
 ALPHA = 0.08        # lissage exponentiel par image à 30 i/s (0,05-0,1 : mouvement de caméra posé)
 DEAD = 0.12         # zone morte : le cadre ne bouge pas tant que le visage reste dans ±12 % de sa largeur
+CADRAGE_MAX = 2.0   # zoom de base maximal pour imiter un cadrage serré
+SUIVI_MAX = 0.08    # le cadre ne traîne jamais à plus de 8 % de la largeur du visage derrière lui (yeux gardés)
+VISAGE_MAX = 1.2    # visage ≤ 1,2× la largeur du cadre (zooms compris) : au-delà les yeux sortent du cadre
 FACE_Y = 0.38       # centre du visage à 38 % du haut du cadre → yeux vers le tiers supérieur
 FALLBACK = (0.5, 0.4, 0.0)
 _warned = set()
@@ -182,6 +185,10 @@ def face_track(video, t0, t1, fps=30, crop_w=None, cache_dir=None):
             if abs(raw[j] - target[j]) > dead[j]:
                 target[j] = raw[j]
             cur[j] += ALPHA * 30 / fps * (target[j] - cur[j])
+        # tête qui tourne vite : la zone morte + le lissage laisseraient sortir un œil du cadre zoomé
+        lim = SUIVI_MAX * raw[2] * H / W
+        bord = min(max(cur[0], raw[0] - lim), raw[0] + lim)
+        cur[0] += 0.6 * (bord - cur[0])  # rattrapage rapide mais sans à-coup (dépassement ≤ ~1/3 de pas d'image)
         out.append((t, cur[0], cur[1], cur[2]))
     return out
 
@@ -210,12 +217,12 @@ def active_area(path, info, samples=5, seuil=24):
     return (edge(cols, W // 4), edge(rows, H // 4), edge(cols[::-1], W // 4), edge(rows[::-1], H // 4))
 
 
-def crop_box(W, H, w, h, z, center, face=False):
+def crop_box(W, H, w, h, z, center, face=False, face_y=None):
     """(x, y, cw, ch) en pixels source : zone au ratio w:h, réduite de `z`, autour de `center` (relatif).
     face=True : le centre (visage) est placé à FACE_Y du haut au lieu du milieu."""
     cw, ch = min(W, H * w / h) / z, min(H, W * h / w) / z
     x = min(max(center[0] * W - cw / 2, 0), W - cw)
-    y = min(max(center[1] * H - (FACE_Y if face else 0.5) * ch, 0), H - ch)
+    y = min(max(center[1] * H - ((face_y or FACE_Y) if face else 0.5) * ch, 0), H - ch)
     return x, y, cw, ch
 
 
@@ -276,6 +283,19 @@ def doux_u(segs, style):
             done += s["frames"]
 
 
+def base_zoom(track, W, H, w, h, cadrage):
+    """Zoom de base d'un plan face caméra pour retrouver le cadrage de la DA (`cadrage.visage_largeur` = largeur
+    du visage / largeur de l'image 9:16). 1.0 si inconnu ou si le rush est déjà plus serré (on ne dézoome pas).
+    Borné à CADRAGE_MAX : au-delà, l'image d'un rush 1080p devient trop molle."""
+    cible = (cadrage or {}).get("visage_largeur")
+    tailles = sorted(t[3] for t in track or [] if t and t[3] > 0)
+    if not cible or not tailles:
+        return 1.0
+    face_px = tailles[len(tailles) // 2] * H  # boîte YuNet ≈ carrée : hauteur relative × H = largeur en px
+    cw = min(W, H * w / h)
+    return round(min(max(cible * cw / face_px, 1.0), CADRAGE_MAX), 4)
+
+
 def segment_scales(seg, kind, prev=1.0, fps=30, rampe_s=0.5):
     """Échelle par image d'un segment (render et export_xml) : courbe du type de zoom, ou, pour un morceau d'un
     segment « doux » découpé par pacing (`doux_u`, voir doux_u), sa part de la poussée continue du segment entier."""
@@ -301,7 +321,7 @@ def _frames_rgb(video, t0=None, t1=None, n=8):
 
     def grab(t):
         return subprocess.run([ffmpeg(), "-v", "error", "-ss", f"{t:.3f}", "-i", str(video), "-frames:v", "1",
-                               "-vf", f"scale={w}:{h}", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
+                               "-vf", f"scale={w}:{h},{tonemap(info)}null", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
                               capture_output=True).stdout
 
     with ThreadPoolExecutor(4) as pool:

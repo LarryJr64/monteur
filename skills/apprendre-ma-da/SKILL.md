@@ -35,7 +35,9 @@ impression ; si une image contredit une mesure, dis-le dans STYLE.md et garde la
 Le résumé signale une vidéo **atypique** (« ne ressemble pas aux autres ») : demande-lui si c'est voulu ;
 sinon qu'il la retire de mes-videos/ et relance.
 
-Ce qui est mesuré (ne pas réinventer) : rythme (plan moyen, coupes/min, plus long silence), respiration
+Ce qui est mesuré (ne pas réinventer) : rythme (plan moyen, coupes/min, plus long silence, **distribution** des
+durées de plans `plans_quantiles` 10-25-50-75-90 %, plan médian de l'accroche `hook_plan_s`), **cadrage** (taille du
+visage `cadrage.visage_largeur` en part de la largeur, hauteur `visage_y` : le rendu cadre pareil), respiration
 (`rythme.respiration_intra_s` / `respiration_phrases_s` / `coupe_avant_mot_s`), zooms (par minute, intensité,
 `types` doux/punch/crash/cut, `rampe_s`, `sur_visage`, `une_coupe_sur`), sous-titres (présence, taille,
 position, couleur, `couleur_mot_cle`, `mots_cles_part_blocs`, `emojis_par_minute`), audio (LUFS, musique,

@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from common import die, ffmpeg, probe, run
+from common import die, ffmpeg, probe, run, tonemap
 
 try:  # lot B (parole) : même mesure de respiration que le rendu
     from pacing import measure_breathing
@@ -46,12 +46,14 @@ FOND_MUSIQUE_DB = -48      # niveau des 10 % de passages les plus calmes : au-de
 ZOOM_ECHELLES_FINES = np.arange(1.0, 1.4001, 0.01)
 RAMPE_CRASH_S = 0.27       # rampe ≤ 8 images à 30 i/s : crash zoom (design : 4-6 images)
 RAMPE_DOUX_S = 0.8         # rampe ≥ 0,8 s (ou ≥ 60 % du plan) : poussée lente
+VISAGE_YEUX = 0.35         # demi-écart des yeux (coins extérieurs) en part de la largeur de la boîte visage
 COULEUR_LARGEUR = 288      # images couleur (visages, couleur, sous-titres colorés, emojis)
 COULEUR_IMAGES_MAX = 240
 VISAGE_TAILLE_MIN = 0.10   # visage ≥ 10 % de la largeur : l'orateur (un visage minuscule dans un b-roll ne compte pas)
 YUNET = Path.home() / ".cache" / "monteur" / "face_detection_yunet_2023mar.onnx"  # téléchargé par doctor.py
 PAUSE_MIN_S = 0.06         # écart entre mots en dessous : coarticulation, pas une respiration (= pacing)
 FIN_PHRASE = ".?!…"
+HOOK_S = 3.0               # l'accroche : les 3 premières secondes (rythme mesuré à part)
 DEFAUT_RESPIRATION = {"respiration_intra_s": 0.18, "respiration_phrases_s": 0.38, "coupe_avant_mot_s": 0.08}
 
 
@@ -61,7 +63,7 @@ def decode(path, width, fps=None, gray=True, info=None):
     if "width" not in info:
         die(f"pas de piste vidéo dans {path}")
     h = max(2, round(width * info["height"] / info["width"] / 2) * 2)
-    vf = (f"fps={fps}," if fps else "") + f"scale={width}:{h}:flags=area"
+    vf = (f"fps={fps}," if fps else "") + f"scale={width}:{h}:flags=area,{tonemap(info)}null"
     ch = 1 if gray else 3
     r = subprocess.run([ffmpeg(), "-v", "error", "-i", str(path), "-an", "-vf", vf, "-f", "rawvideo",
                         "-pix_fmt", "gray" if gray else "rgb24", "-"], capture_output=True)
@@ -97,7 +99,10 @@ def detect_cuts(d, fps):
         ctx = np.concatenate([d[max(1, i - w): max(1, i - 1)], d[i + 2: i + w + 1]])
         fond = np.median(ctx) if len(ctx) else 0.0
         voisins = max(d[i - 1] if i > 1 else 0.0, d[i + 1] if i + 1 < len(d) else 0.0)
-        if d[i] >= COUPE_PLANCHER and d[i] > COUPE_RATIO_FOND * fond and d[i] > COUPE_RATIO_VOISINS * voisins:
+        # fréquence variable (téléphone) ramenée à cadence fixe : image doublée (≈ 0) puis saut de 2 images de
+        # mouvement ; ce saut n'est pas une coupe, il faut un pic bien plus fort
+        doublon = i > 1 and d[i - 1] < 0.25 * max(fond, 0.4)
+        if d[i] >= COUPE_PLANCHER and d[i] > COUPE_RATIO_FOND * fond * (2.5 if doublon else 1) and d[i] > COUPE_RATIO_VOISINS * voisins:
             if not cuts or (i - cuts[-1]) / fps >= COUPE_ECART_MIN_S:
                 cuts.append(i)
     return cuts
@@ -197,11 +202,15 @@ def zooms(frames, cuts, fps):
     return sorted(found, key=lambda z: z["t"])
 
 
-def audio(path, duration):
-    """Loudness intégrée (LUFS) et silences (-35 dB, 0,15 s)."""
+def audio(path, duration, peak=None):
+    """Loudness intégrée (LUFS) et silences (-35 dB, 0,15 s). `peak` (liste) reçoit le true peak en dBTP."""
     out = run([ffmpeg(), "-hide_banner", "-nostats", "-i", str(path), "-vn", "-af",
-               f"silencedetect=noise={SILENCE_DB}dB:d={SILENCE_D},ebur128=framelog=verbose", "-f", "null", "-"])
+               f"silencedetect=noise={SILENCE_DB}dB:d={SILENCE_D},ebur128=framelog=verbose:peak=true",
+               "-f", "null", "-"])
     lufs = re.findall(r"I:\s+(-?[\d.]+) LUFS", out)
+    if peak is not None:
+        tp = re.findall(r"Peak:\s+(-?[\d.]+|-inf) dBFS", out)
+        peak.append(float(tp[-1]) if tp and tp[-1] != "-inf" else None)
     starts = [float(x) for x in re.findall(r"silence_start: (-?[\d.]+)", out)]
     ends = [float(x) for x in re.findall(r"silence_end: (-?[\d.]+)", out)]
     sil = [{"start": round(max(0.0, s), 3), "end": round(e, 3)}
@@ -644,6 +653,45 @@ def zooms_sur_visage(z, visages, fps_c):
     return round(sum(ok) / len(ok), 3) if ok else None
 
 
+def plan_stats(plans):
+    """Distribution des durées de plans (le rythme d'un créateur n'est pas une moyenne : il alterne plans
+    courts et longs, et coupe plus vite dans l'accroche) : quantiles 10-25-50-75-90 % et plan médian des 3 s."""
+    lens = [b - a for a, b in plans]
+    q = [round(float(x), 3) for x in np.percentile(lens, [10, 25, 50, 75, 90])] if lens else None
+    hook = [b - a for a, b in plans if a < HOOK_S] or lens
+    return q, (round(statistics.median(hook), 3) if hook else None)
+
+
+def cadrage(plans, visages, fps_c, broll):
+    """Taille du visage (largeur relative) et hauteur de son centre sur les plans face caméra.
+    Taille de base = 30e centile des plans (les plans zoomés sont plus serrés : la base est le cadre large)."""
+    if not visages or not any(visages):
+        return None
+    n, tailles, ys, bord = len(visages), [], [], []
+    br = {tuple(x) for x in broll or []}
+    for a, b in plans:
+        if (a, b) in br or tuple([a, b]) in br:
+            continue
+        fs = [visages[j] for j in range(n) if a <= j / fps_c < b and visages[j]]
+        if fs:
+            tailles.append(statistics.median(f[2] for f in fs))
+            ys += [f[1] for f in fs]
+            # yeux ≈ ±35 % de la largeur de la boîte autour de son centre : au-delà du bord, un œil est coupé
+            bord += [abs(f[0] - 0.5) + VISAGE_YEUX * f[2] > 0.5 for f in fs]
+    if not tailles:
+        return None
+    return {"visage_largeur": round(float(np.percentile(tailles, 30)), 3), "visage_y": round(statistics.median(ys), 3),
+            "visage_bord": round(sum(bord) / len(bord), 3)}
+
+
+def images_noires(rgb):
+    """Part des images quasi noires (luma moyenne < 0,04) : un trou dans le montage, sauf si la DA en a."""
+    if rgb is None or not len(rgb):
+        return None
+    y = rgb.astype(np.float32).mean(axis=(1, 2, 3)) / 255
+    return round(float((y < 0.04).mean()), 4)
+
+
 def measure(path, words=None):
     """Toutes les mesures d'une vidéo, au format de profile.json → mesures_brutes.
     `words` = mots horodatés dans le temps de CETTE vidéo (transcript d'une référence, ou mots de la sortie
@@ -659,7 +707,8 @@ def measure(path, words=None):
     lens = [b - a for a, b in plans]
     z = zooms(frames, cuts, fps)
     del frames
-    lufs, sil = audio(path, dur) if info["has_audio"] else (None, [])
+    tp = []
+    lufs, sil = audio(path, dur, tp) if info["has_audio"] else (None, [])
     inner = [s["end"] - s["start"] for s in sil if s["start"] > 0.05 and s["end"] < dur - 0.05]
     minutes = max(dur, 1e-6) / 60
     st_score, (st_h, st_y) = caption_score(path, info, geometry=True)
@@ -669,11 +718,14 @@ def measure(path, words=None):
     visages = faces(rgb, path, fps_c)
     br = broll_plans(plans, visages, fps_c)
     couleur = color_stats(path, rgb)
+    noir = images_noires(rgb)
+    cad = cadrage(plans, visages, fps_c, br)
     caps = caption_colors(rgb, st_y, st_h) if st_score >= 0.3 else None
     n_emo = emoji_count(rgb, st_y, st_h, fps_c, visages) if st_score >= 0.3 else None
     del rgb
 
     types = Counter(x["type"] for x in z)
+    quant, hook_plan = plan_stats(plans)
     rampes = [x["rampe_s"] for x in z if x["type"] in ("punch", "crash")]
     m = {
         "duree": round(dur, 3),
@@ -681,6 +733,7 @@ def measure(path, words=None):
         "plans": plans,
         "duree_moyenne_plan_s": round(dur / len(plans), 3),
         "mediane_plan_s": round(statistics.median(lens), 3),
+        "plans_quantiles": quant, "hook_plan_s": hook_plan,
         "coupes_par_minute": round(len(cuts) / minutes, 2),
         "zooms": z,
         "zooms_par_minute": round(len(z) / minutes, 2),
@@ -691,6 +744,7 @@ def measure(path, words=None):
         "zoom_sur_visage": zooms_sur_visage(z, visages, fps_c),
         "zoom_une_coupe_sur": round(len(plans) / len(z), 1) if z else None,
         "lufs": lufs,
+        "true_peak_db": tp[0] if tp else None,
         "silences": sil,
         "silence_max_s": round(max(inner, default=0.0), 3),
         "silence_part": round(sum(s["end"] - s["start"] for s in sil) / max(dur, 1e-6), 3),
@@ -702,6 +756,8 @@ def measure(path, words=None):
         "fond_sonore_db": fond_sonore(path) if info["has_audio"] else None,
         "musique_tonalite": musique_tonalite(path) if info["has_audio"] else None,
         "couleur": couleur,
+        "images_noires": noir,
+        "cadrage": cad,
         "visage_part": round(sum(1 for f in visages if f) / len(visages), 3) if visages else None,
         "broll_plans": br,
         "broll_part": round(sum(b - a for a, b in br) / max(dur, 1e-6), 3) if br is not None else None,

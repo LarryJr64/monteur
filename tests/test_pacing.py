@@ -262,3 +262,27 @@ def test_real_audio_cuts_in_silence(transcribed, tmp_path):
 
 
 from test_transcribe import media, transcribed  # noqa: E402,F401  (fixtures partagées, une seule transcription)
+
+
+def test_coupe_elargie_sur_l_energie_jamais_une_attaque_mangee(tmp_path):
+    """La transcription date « tout » 80 ms trop tard et « monde » 80 ms trop tôt (grille Parakeet) : l'énergie du son
+    (10 ms) élargit les coupes pour garder l'attaque et la fin réelles ; sans son, comportement inchangé."""
+    sr = 16000
+    x = np.zeros(int(sr * 4), np.float32)
+    rng = np.random.default_rng(0)
+    x += rng.normal(0, 0.002, len(x)).astype(np.float32)  # bruit de pièce
+    for a, b in ((1.00, 1.60), (2.40, 3.10)):  # voix réelle : 1,00-1,60 puis 2,40-3,10
+        t = np.arange(int((b - a) * sr)) / sr
+        x[int(a * sr):int(b * sr)] += 0.3 * np.sin(2 * np.pi * 220 * t)
+    (tmp_path / "rushs").mkdir(parents=True)
+    with wave.open(str(tmp_path / "rushs" / "e.mp4"), "wb") as w:  # wav sous un nom de rush : ffmpeg lit le contenu
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)  # noqa: E702
+        w.writeframes((x * 32767).astype(np.int16).tobytes())
+    words = [W("tout", 1.08, 1.60), W("monde.", 2.40, 3.02)]  # début de « tout » tardif, fin de « monde » précoce
+    setup(tmp_path, words, "e")
+    prof = {"rythme": {"respiration_intra_s": 0.2, "respiration_phrases_s": 0.3, "coupe_avant_mot_s": 0.0}}
+    res = pacing.normalize_edl(edl([seg(1.08, 3.02, "e")]), tmp_path, prof)
+    pieces = res["segments"]
+    assert pieces[0]["start"] <= 1.00 + 1e-6  # l'attaque réelle (1,00) est gardée
+    assert pieces[-1]["end"] >= 3.10 - 1e-6  # la fin réelle (3,10) aussi
+    assert pieces[0]["start"] >= 0.75  # mais on ne remonte pas dans le silence

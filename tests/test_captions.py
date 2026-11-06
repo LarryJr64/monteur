@@ -150,3 +150,15 @@ def test_taille_reelle_par_police():
         assert 0.3 < cap_r < 0.6 and 0.5 < em_r < 0.9, f
     assert abs(captions.font_ratios(captions.FONTS_DIR / "Montserrat-ExtraBold.ttf")[0] - captions.CAP_RATIO) < 0.01
     assert captions.font_ratios(captions.FONTS_DIR / "absent.ttf") is None
+
+
+def test_mots_cles_doses_comme_la_da():
+    """Claude propose un mot-clé presque partout ; la DA en a sur 1 bloc sur 3 → on en garde 1/3, chiffres d'abord."""
+    ws = [{"w": w, "start": i * 0.3, "end": i * 0.3 + 0.25, "cle": i % 2 == 0}
+          for i, w in enumerate("un deux 300 quatre cinq six sept huit neuf dix onze douze".split())]
+    blocks = captions.make_blocks(ws, 2)
+    dosed = captions.dose_keywords(blocks, 1 / 3)
+    n = sum(any(w.get("cle") for w in b["words"]) for b in dosed)
+    assert n == 2 and len(dosed) == 6
+    assert any(w.get("cle") and w["w"] == "300" for b in dosed for w in b["words"])  # le chiffre gardé
+    assert captions.dose_keywords(blocks, 0.9) == blocks  # jamais d'ajout

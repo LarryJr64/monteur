@@ -10,6 +10,7 @@
 3. mux.
 """
 import argparse
+from fractions import Fraction
 import json
 import math
 import shutil
@@ -24,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import die, ffmpeg, probe, run  # noqa: E402
+from common import die, ffmpeg, probe, run, tonemap  # noqa: E402
 import captions  # noqa: E402
 import reframe as rf  # noqa: E402
 
@@ -52,25 +53,39 @@ def reframe(W, H, w, h, zoom=1.0, center=(0.5, 0.5)):
 def venc(draft, final=False):
     # intermédiaires quasi sans perte et rapides ; la qualité de livraison se joue à la finition
     preset, crf = ("ultrafast", "28") if draft else (("veryfast", "19") if final else ("ultrafast", "14"))
-    return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-profile:v", "high", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-profile:v", "high", "-pix_fmt", "yuv420p",
+            # mêmes étiquettes sur tous les intermédiaires : sinon le concat reconfigure ses filtres et perd des images
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
 
 
 # ---------- plan image par image ----------
 
-def plan(seg, info, w, h, fps, track, kind, prev, rampe_s, use_face):
-    """Recadrage par image [(x, y, cw, ch)] (px source) + visage dans le cadre [(haut, bas) relatifs | None]."""
-    W, H = info["width"], info["height"]
+def plan(seg, info, w, h, fps, track, kind, prev, rampe_s, use_face, cadrage=None):
+    """Recadrage par image [(x, y, cw, ch)] (px source) + visage dans le cadre [(haut, bas) relatifs | None].
+    `cadrage` (profil) : taille et hauteur du visage de la DA sur les plans face caméra."""
+    W, H = info.get("width"), info.get("height")
+    if not W:  # voix off (son seul) : fond noir, l'image vient des plans posés dessus
+        return [(0, 0, w, h)] * seg["frames"], [None] * seg["frames"], 1.0
     bl, bt, br, bb = info.get("bandes") or (0, 0, 0, 0)  # bandes noires du média : jamais dans le cadre
     aw, ah = W - bl - br, H - bt - bb
     scales = rf.segment_scales(seg, kind, prev, fps, rampe_s)
+    last = scales[-1]
+    cad = cadrage if use_face and track else None
+    base = rf.base_zoom(track, aw, ah, w, h, cad) if cad else 1.0
+    if base != 1.0:
+        scales = [z * base for z in scales]
+    face_y = (cad or {}).get("visage_y")
+    vmax = max(rf.VISAGE_MAX, 1.1 * ((cadrage or {}).get("visage_largeur") or 0))  # une DA plus serrée reste la sienne
     center = seg.get("zoom_center")
     fixed = tuple(center) if isinstance(center, (list, tuple)) else (0.5, 0.5)
     crops, faces = [], []
     for i, z in enumerate(scales):
         t = track[min(i, len(track) - 1)] if track else None
         cx, cy = (t[1], t[2]) if use_face and t else fixed
+        if use_face and t and t[3] > 0:  # zoom (base × type) borné : le visage ne déborde pas au point de couper les yeux
+            z = min(z, max(1.0, vmax * min(aw, ah * w / h) / (t[3] * H)))
         x, y, cw, ch = rf.crop_box(aw, ah, w, h, z, ((cx * W - bl) / aw, (cy * H - bt) / ah),
-                                   face=use_face and bool(t))
+                                   face=use_face and bool(t), face_y=face_y)
         c = (x + bl, y + bt, cw, ch)
         crops.append(c)
         if t and t[3] > 0:
@@ -80,7 +95,7 @@ def plan(seg, info, w, h, fps, track, kind, prev, rampe_s, use_face):
             faces.append((((t[2] - t[3] / 2) * H - y) / ch, ((t[2] + t[3] * 0.58) * H - y) / ch) if inside else None)
         else:
             faces.append(None)
-    return crops, faces, scales[-1]
+    return crops, faces, last
 
 
 def _even(n):
@@ -96,9 +111,18 @@ def _input_args(src, seg, fps, image):
 
 def render_segment(seg, src, out, w, h, fps, crops, colour, draft, with_audio=True, image=False):
     info = probe(src)
-    if "width" not in info:
-        die(f"pas de piste vidéo dans {src}")
     dur = seg["frames"] / fps
+    if "width" not in info:
+        if not (with_audio and info.get("has_audio")):
+            die(f"pas de piste vidéo dans {src}")
+        # voix off (fichier son) : fond noir sous la voix, recouvert par les plans des rushs
+        af = (f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{dur:.6f},"
+              f"afade=t=in:d={FADE},afade=t=out:st={max(0, dur - FADE):.6f}:d={FADE}")
+        run([ffmpeg(), "-y", "-v", "error", "-ss", f"{seg['start']:.6f}", "-t", f"{dur + 0.5:.6f}", "-i", str(src),
+             "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps}", "-filter_complex",
+             f"[1:v]setsar=1,format=yuv420p[v];[0:a]{af}[a]", "-map", "[v]", "-frames:v", str(seg["frames"]),
+             "-r", str(fps), *venc(draft), "-map", "[a]", "-c:a", "pcm_s16le", str(out)])
+        return
     post = "setsar=1" + (f",{colour}" if colour else "") + ",format=yuv420p"
     af = (f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{dur:.6f},"
           f"afade=t=in:d={FADE},afade=t=out:st={max(0, dur - FADE):.6f}:d={FADE}")
@@ -116,7 +140,9 @@ def render_segment(seg, src, out, w, h, fps, crops, colour, draft, with_audio=Tr
     tail = ["-frames:v", str(seg["frames"]), "-r", str(fps), *venc(draft), *a_map, str(out)]
     if not moving:
         x, y, cw, ch = x0
-        vf = f"fps={fps},crop={cw:.0f}:{ch:.0f}:{x:.0f}:{y:.0f},scale={w}:{h}:flags=lanczos,{post}"
+        # tpad : un plan plus court que sa place à l'écran garde sa dernière image (jamais de trou noir)
+        pad = f"tpad=stop_mode=clone:stop_duration={dur + 1:.3f}," if not with_audio else ""  # b-roll seulement
+        vf = f"fps={fps},{tonemap(info)}crop={cw:.0f}:{ch:.0f}:{x:.0f}:{y:.0f},scale={w}:{h}:flags=lanczos,{pad}{post}"
         graph = f"[0:v]{vf}[v]" + (f";[{0 if src_audio else 1}:a]{af}[a]" if with_audio else "")
         run([ffmpeg(), "-y", "-v", "error", *_input_args(src, seg, fps, image), *silence,
              "-filter_complex", graph, "-map", "[v]", *tail])
@@ -133,7 +159,8 @@ def _render_warp(src, info, seg, crops, w, h, fps, post, af, a_args, tail, draft
     W, H = _even(info["width"]), _even(info["height"])
     kx, ky = W / info["width"], H / info["height"]
     dec = subprocess.Popen([ffmpeg(), "-v", "error", *_input_args(src, seg, fps, image),
-                            "-vf", f"fps={fps},scale={W}:{H}", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"],
+                            "-vf", f"fps={fps},scale={W}:{H},{tonemap(info)}null", "-pix_fmt", "yuv420p",
+                            "-f", "rawvideo", "-"],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     err = tempfile.TemporaryFile()
     graph = f"[0:v]{post}[v]" + (f";[1:a]{af}[a]" if a_args else "")
@@ -310,12 +337,12 @@ def main():
     infos = {}
     for p in {root / s["source"] for s in segs} | {b["path"] for b in brolls}:
         infos[p] = probe(p)
-        if p.suffix.lower() not in IMAGE_EXT:
+        if p.suffix.lower() not in IMAGE_EXT and infos[p].get("width"):
             infos[p]["bandes"] = rf.active_area(p, infos[p])
             if any(infos[p]["bandes"]):
                 print(f"{p.name} : bandes noires retirées du cadre (g/h/d/b px) {infos[p]['bandes']}")
     cache_dir = root / ".monteur"
-    jobs = [(root / s["source"], s) for s in segs] + [(b["path"], b) for b in brolls if not b["image"]]
+    jobs = [(root / s["source"], s) for s in segs if infos[root / s["source"]].get("width")] +         [(b["path"], b) for b in brolls if not b["image"]]
     with ThreadPoolExecutor(4) as pool:
         tracks = list(pool.map(lambda j: rf.face_track(j[0], j[1]["start"], j[1]["start"] + j[1]["frames"] / fps,
                                                        fps, cache_dir=cache_dir), jobs))
@@ -327,12 +354,13 @@ def main():
     for s in segs:
         kind = s.get("zoom_type") or ("doux" if style == "doux" and s.get("zoom", 1.0) > 1.0 else None)
         use_face = s.get("zoom_center") == "visage" or (v2 and "zoom_center" not in s)
-        crops, f, prev = plan(s, infos[root / s["source"]], w, h, fps, track_of[id(s)], kind, prev, rampe_s, use_face)
+        crops, f, prev = plan(s, infos[root / s["source"]], w, h, fps, track_of.get(id(s)), kind, prev, rampe_s, use_face,
+                              profile.get("cadrage"))
         plans.append(crops)
         faces += f
     bplans = []
     for b in brolls:
-        crops, _, _ = plan(b, infos[b["path"]], w, h, fps, track_of.get(id(b)), None, 1.0, rampe_s,
+        crops, _, _ = plan(b, infos[b["path"]], w, h, fps, track_of.get(id(b)), b.get("zoom_type"), 1.0, rampe_s,
                            b["zoom_center"] == "visage" and not b["image"])
         bplans.append(crops)
     colours = {}
@@ -343,6 +371,8 @@ def main():
         spans = {}
         for item, crops in [(s, c) for s, c in zip(segs, plans)] + [(b, c) for b, c in zip(brolls, bplans)]:
             p = item["path"] if "path" in item else root / item["source"]
+            if not infos[p].get("width"):
+                continue  # voix off : pas d'image
             W, H = infos[p]["width"], infos[p]["height"]
             spans.setdefault(p, []).extend((x / W, y / H, (x + cw) / W, (y + ch) / H) for x, y, cw, ch in crops[::5])
         boxes = {p: tuple(statistics.median(c[k] for c in v) for k in range(4)) for p, v in spans.items()}
@@ -387,19 +417,31 @@ def main():
         th.start()
         t_audio = time.time()
 
-        args = [ffmpeg(), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", "list.txt"]
-        graph, v, n = [], "[0:v]", 1
+        args = [ffmpeg(), "-y", "-v", "error", "-reinit_filter", "0", "-f", "concat", "-safe", "0", "-i", "list.txt"]
+        fr = Fraction(fps).limit_denominator(1001)
+        tb = f"settb={fr.denominator}/{fr.numerator}"  # une unité de temps = une image (29,97 compris)
+        graph, v, n = [f"[0:v]{tb},setpts=N[base]"], "[base]", 1
         if colours:
             # boucle fermée : on mesure les plans tels qu'ils seront vus (zooms, cadrage compris) et on corrige
             # l'écart restant à la DA en une passe globale (la correction par média, bornée, n'y arrive pas seule)
+            # ce qui est à l'écran : chaque segment pour le temps où aucun b-roll ne le recouvre, et les b-roll
+            vus, poids, off = [], [], 0.0
+            for s, nm in zip(segs, names):
+                d = s["frames"] / fps
+                cache = sum(max(0.0, min(off + d, b["at"] + b["frames"] / fps) - max(off, b["at"])) for b in brolls)
+                if d - cache > 1 / fps and infos[root / s["source"]].get("width"):
+                    vus.append(tmp / nm)
+                    poids.append(d - cache)
+                off += d
+            vus += [tmp / bn for bn in bnames]
+            poids += [b["frames"] / fps for b in brolls]
             with ThreadPoolExecutor(4) as pool:
-                st_segs = list(pool.map(lambda nm: rf.measure_colour(tmp / nm, n=3), names))
-            vu = rf.pooled_colour(st_segs, [s["frames"] for s in segs])
+                st_segs = list(pool.map(lambda f: rf.measure_colour(f, n=3), vus))
+            vu = rf.pooled_colour(st_segs, poids)
             reste = rf.colour_filter(vu, target)
-            if reste:
-                graph.append(f"[0:v]{reste}[vc]")
-                v = "[vc]"
             print(f"  couleur à l'écran {vu} → cible {target} : correction finale « {reste or 'aucune'} »")
+        else:
+            reste = ""
         trans = (profile.get("broll") or {}).get("transition", "coupe")
         for k, (b, bn) in enumerate(zip(brolls, bnames)):
             args += ["-i", bn]
@@ -409,9 +451,16 @@ def main():
                 fd = 3 / fps
                 fade = (f"format=yuva420p,fade=t=in:st=0:d={fd:.4f}:alpha=1,"
                         f"fade=t=out:st={d - fd:.4f}:d={fd:.4f}:alpha=1,")
-            graph.append(f"[{n}:v]{fade}setpts=PTS-STARTPTS+{b['at']}/TB[b{k}]")
-            graph.append(f"{v}[b{k}]overlay=eof_action=pass:enable='between(t,{b['at']},{b['at'] + d})'[v{k}]")
+            # temps en numéros d'image (base de temps 1/fps) : les instants des fichiers intermédiaires (mkv, 1 ms)
+            # sont arrondis ; comparés en secondes, la 1re ou la dernière image d'un b-roll sautait (noir en voix off,
+            # visage de l'orateur ailleurs)
+            f0 = round(b["at"] * fps)
+            graph.append(f"[{n}:v]{fade}{tb},setpts=N+{f0}[b{k}]")
+            graph.append(f"{v}[b{k}]overlay=eof_action=pass:enable='between(n,{f0},{f0 + b['frames'] - 1})'[v{k}]")
             v, n = f"[v{k}]", n + 1
+        if reste:  # après les b-roll : la correction finale vaut pour tout ce qui est à l'écran
+            graph.append(f"{v}{reste}[vc]")
+            v = "[vc]"
 
         st = profile.get("sous_titres")
         fw, fh = fmt["width"], fmt["height"]
@@ -442,11 +491,9 @@ def main():
             graph.append(f"{v}[e{j}]overlay=x='{e['x'] * k:.1f}-w/2':y='{e['y'] * k:.1f}-h/2':eval=frame:"
                          f"eof_action=pass:enable='between(t,{e['start']:.3f},{e['end']:.3f})'[ve{j}]")
             v, n = f"[ve{j}]", n + 1
-        if v == "[0:v]":
-            graph.append("[0:v]null[vout]")
-            v = "[vout]"
+
         args += ["-filter_complex", ";".join(graph), "-map", v, "-an", "-t", f"{total:.6f}",
-                 "-r", str(fps), *venc(a.brouillon, final=True), "video.mkv"]
+                 "-r", str(fps), *venc(a.brouillon, final=True), "-video_track_timescale", "90000", "video.mp4"]
         run_in(args, tmp)
         stage(f"finition vidéo (b-roll, sous-titres, {len(emojis)} emojis)")
         th.join()
@@ -456,7 +503,8 @@ def main():
         print(f"  son : {how} (fini {max(0, time.time() - t_audio):.1f} s après le début de la finition)")
 
         # 3. mux
-        run([ffmpeg(), "-y", "-v", "error", "-i", str(tmp / "video.mkv"), "-i", str(mix), "-map", "0:v", "-map", "1:a",
+        run([ffmpeg(), "-y", "-v", "error", "-i", str(tmp / "video.mp4"), "-i", str(mix), "-map", "0:v", "-map", "1:a",
+             "-video_track_timescale", "90000",  # mkv (1 ms) arrondissait les instants : 29,999 i/s au lieu de 30
              "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{total:.6f}",
              "-movflags", "+faststart", str(out)])
         stage("mux")

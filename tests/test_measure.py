@@ -244,3 +244,14 @@ def test_respiration_et_hook():
     assert h["type"] == "choc" and h["duree_s"] == 1.3
     assert measure.respiration(words[:5])["respiration_phrases_s"] is None  # < 3 mesures : pas un défaut déguisé
     assert measure.hook([{"w": "Combien", "start": 0, "end": 0.4}, {"w": "gagnes-tu ?", "start": 0.5, "end": 1}])["type"] == "question"
+
+
+def test_distribution_cadrage_noir():
+    q, hook = measure.plan_stats([[0, 1], [1, 1.5], [1.5, 2.5], [2.5, 5.5], [5.5, 9.5]])
+    assert q[2] == 1.0 and q[0] < q[2] < q[4] and hook == 1.0  # accroche : plans commençant avant 3 s (1 ; 0,5 ; 1 ; 3)
+    vis = [(0.5, 0.4, 0.3)] * 6 + [None] * 3 + [(0.5, 0.45, 0.6)] * 3
+    cad = measure.cadrage([[0, 2], [2, 3], [3, 4]], vis, 3.0, [[2, 3]])
+    assert cad["visage_largeur"] < 0.45 and 0.4 <= cad["visage_y"] <= 0.45  # base = plans larges, b-roll exclu
+    noir = np.zeros((4, 8, 8, 3), np.uint8)
+    noir[2:] = 200
+    assert measure.images_noires(noir) == 0.5

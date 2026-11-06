@@ -54,12 +54,57 @@ def _pads(allowed, pre):
     return max(TAIL_MIN, allowed - pre), pre
 
 
+class Envelope:
+    """Niveau du son par tranches de 10 ms d'un média (dB) : la transcription date les mots à ~80 ms près
+    (grille Parakeet) ; l'énergie dit où la voix commence et s'arrête vraiment. Sert uniquement à ÉLARGIR une coupe
+    qui mangerait une attaque ou une fin de mot — jamais à la resserrer."""
+    STEP = 0.01
+
+    def __init__(self, path):
+        import subprocess
+        import numpy as np
+        from common import ffmpeg
+        raw = subprocess.run([ffmpeg(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le",
+                              "-"], capture_output=True).stdout
+        x = np.frombuffer(raw, np.int16).astype(np.float32) / 32768
+        n = len(x) // 160
+        if n < 10:
+            raise ValueError("pas de son")
+        rms = np.sqrt((x[:n * 160].reshape(n, 160) ** 2).mean(axis=1)) + 1e-6
+        self.db = 20 * np.log10(rms)
+        self.np = np
+
+    def _floor(self, t):
+        i0, i1 = max(0, int((t - 1.5) / self.STEP)), int((t + 1.5) / self.STEP)
+        seg = self.db[i0:i1]
+        return float(self.np.percentile(seg, 10)) if len(seg) else -90.0
+
+    def onset(self, t_word, lo):
+        """Début réel de la voix d'un mot daté `t_word` : dernière tranche calme avant le mot (≥ `lo`)."""
+        thr = self._floor(t_word) + 9
+        i = int((t_word + 0.04) / self.STEP)
+        i_lo = max(int(lo / self.STEP), int((t_word - 0.2) / self.STEP), 0)
+        while i > i_lo and i - 1 < len(self.db) and self.db[i - 1] > thr:
+            i -= 1
+        return i * self.STEP
+
+    def offset(self, t_word, hi):
+        """Fin réelle de la voix d'un mot fini à `t_word` : première tranche calme après (≤ `hi`)."""
+        thr = self._floor(t_word) + 9
+        i = int((t_word - 0.04) / self.STEP)
+        hi = min(hi, t_word + 0.25)  # hi peut être infini (dernier mot du fichier)
+        i_hi = min(int(hi / self.STEP), len(self.db))
+        while i < i_hi and self.db[i] > thr:
+            i += 1
+        return i * self.STEP
+
+
 def _seg_words(seg, words):
     """Mots du segment (milieu dans [start, end[, même règle que captions.timeline_words)."""
     return [w for w in words if seg["start"] <= (w["start"] + w["end"]) / 2 < seg["end"]]
 
 
-def _cut_plan(seg, words, r, last_seg):
+def _cut_plan(seg, words, r, last_seg, env=None):
     """Morceaux (start, end, mots, limite dure) d'un segment : fillers isolés retirés, silences compressés.
     Les bords externes ne sont posés qu'ici en pré-roll / traîne ; render arrondit à l'image ensuite."""
     inside = _seg_words(seg, words)
@@ -102,6 +147,20 @@ def _cut_plan(seg, words, r, last_seg):
             pieces.append((cur_start, min(a["end"] + tail, hi), cur, hi))
             cur_start, cur = max(b["start"] - p, lo), []
     pieces.append((cur_start, end, cur, next_start))
+    if env is not None:  # élargir les coupes qui mangeraient une attaque / une fin de mot (jamais les resserrer)
+        fixed = []
+        for k, (a, b, pw, hard) in enumerate(pieces):
+            if pw:
+                prev_lim = fixed[-1][1] if fixed else prev_end
+                i_first = words.index(pw[0])
+                lo = max(prev_lim, words[i_first - 1]["end"] if i_first else 0.0)
+                a = min(a, max(lo, env.onset(pw[0]["start"], lo) - 0.02))
+                i_last = words.index(pw[-1])
+                nxt = words[i_last + 1]["start"] if i_last + 1 < len(words) else math.inf
+                lim = min(hard, nxt)
+                b = max(b, min(env.offset(pw[-1]["end"], lim) + 0.02, lim - 0.01))
+            fixed.append((a, b, pw, hard))
+        pieces = fixed
     return pieces, dropped
 
 
@@ -131,6 +190,16 @@ def normalize_edl(edl, root, profile):
             cache[src] = sorted((t or {}).get("words", []), key=lambda w: w["start"])
         return cache[src]
 
+    envs = {}
+
+    def env_of(src):
+        if src not in envs:
+            try:
+                envs[src] = Envelope(root / src) if (root / src).is_file() else None
+            except Exception:  # noqa: BLE001 — pas de son lisible : coupes à la transcription seule
+                envs[src] = None
+        return envs[src]
+
     segs_in = edl.get("segments") or []
     out_segs, old_off, timeline = [], [], []  # timeline : mots gardés en temps final
     off_in, off_out, dropped = 0.0, 0.0, 0
@@ -139,7 +208,7 @@ def normalize_edl(edl, root, profile):
         old_off.append(off_in)
         off_in += max(0.0, s["end"] - s["start"])
         ws = words_of(s["source"])
-        pieces, d = _cut_plan(s, ws, r, i == len(segs_in) - 1)
+        pieces, d = _cut_plan(s, ws, r, i == len(segs_in) - 1, env_of(s["source"]))
         dropped += d
         plan.append([])
         doux = s.get("zoom_type") == "doux"
@@ -193,6 +262,32 @@ def normalize_edl(edl, root, profile):
                 return o + src_t - a
         return (ps[-1][2] + ps[-1][1] - ps[-1][0]) if ps else total
 
+    def src_to_final(src, t):
+        """Instant `t` du fichier `src` (la voix off) → temps final rendu ; partie coupée → morceau suivant."""
+        best = None
+        for i, sg in enumerate(segs_in):
+            if Path(sg["source"]).as_posix() != Path(src).as_posix():
+                continue
+            for a, b, o in plan[i]:
+                if a <= t < b:
+                    return o + t - a
+                if t < a and (best is None or o < best):
+                    best = o
+        return best if best is not None else total
+
+    if edl.get("mode") == "voix_off":
+        res = dict(edl, segments=out_segs, broll=_voix_off_plans(edl, root, timeline, total, fps, src_to_final, remap))
+        for key in ("titles", "sfx"):
+            if edl.get(key):
+                res[key] = [dict(x, at=round(remap(x["at"]), 3)) for x in edl[key]]
+        res["pacing"] = {"duree_avant_s": round(off_in, 3), "duree_apres_s": round(total, 3),
+                         "segments_avant": len(segs_in), "morceaux": len(out_segs), "hesitations_coupees": dropped,
+                         "rythme": r, "mode": "voix_off"}
+        wd = root / ".monteur"
+        wd.mkdir(parents=True, exist_ok=True)
+        (wd / "edl.rendu.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+        return res
+
     sent_end = _sentence_words(timeline)
     protected = [(p[2], p[2] + p[1] - p[0]) for i, s in enumerate(segs_in) if re.search(r"hook|cta", str(s.get("note") or ""), re.I)
                  for p in plan[i]]
@@ -235,6 +330,65 @@ def normalize_edl(edl, root, profile):
     wd.mkdir(parents=True, exist_ok=True)
     (wd / "edl.rendu.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     return res
+
+
+def load_plans(root):
+    """Index des plans des rushs (scripts/plans.py) : {"P12": {"source", "start", "end", ...}} ou {}."""
+    f = Path(root) / ".monteur" / "plans.json"
+    try:
+        return json.loads(f.read_text(encoding="utf-8")).get("plans", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _voix_off_plans(edl, root, timeline, total, fps, src_to_final, remap):
+    """Mode voix off : les plans des rushs couvrent TOUTE la vidéo, bout à bout. Chaque plan commence sur son
+    mot (`voix_t` = instant dans le fichier de la voix, + `mot`), finit au début du suivant ; le premier part de 0.
+    `plan` (ex. "P12") = plan de l'index plans.json : source et bornes du plan ; on n'en déborde jamais si
+    possible (sinon la dernière image est tenue)."""
+    index = load_plans(root)
+    voix = (edl.get("segments") or [{}])[0].get("source")
+    items = []
+    for b in edl.get("broll") or []:
+        b = dict(b)
+        pl = index.get(str(b.get("plan", "")).upper()) if b.get("plan") else None
+        if b.get("plan") and not pl:
+            print(f"plan {b['plan']} absent de .monteur/plans.json : ignoré")
+            continue
+        if pl:
+            b.setdefault("source", pl["source"])
+            b["source_start"] = pl["start"] + float(b.get("decalage", 0.0))
+            b["_fin_plan"], b["_debut_plan"] = pl["end"], pl["start"]
+            if pl.get("scene"):
+                b["scene"] = pl["scene"]
+        if "source" not in b:
+            continue
+        at = src_to_final(b.get("voix_source", voix), b["voix_t"]) if "voix_t" in b else remap(b.get("at", 0.0))
+        k = _anchor(timeline, at, b.get("mot")) if b.get("mot") else None
+        start = max(0.0, timeline[k]["start"] - BROLL_EARLY_FRAMES / fps) if k is not None else at
+        items.append((round(start * fps) / fps, b))
+    items.sort(key=lambda x: x[0])
+    out = []
+    for j, (start, b) in enumerate(items):
+        if j == 0:
+            start = 0.0  # jamais de noir au début
+        end = items[j + 1][0] if j + 1 < len(items) else total
+        if end - start < 2 / fps:  # deux plans sur le même mot : le second gagne
+            continue
+        if out and abs(out[-1]["at"] + out[-1]["duration"] - start) > 1e-6:
+            out[-1]["duration"] = round(start - out[-1]["at"], 6)  # le précédent va jusqu'à celui-ci
+        dur = end - start
+        fin = b.pop("_fin_plan", None)
+        debut = b.pop("_debut_plan", b.get("source_start", 0.0))
+        ss = b.get("source_start", 0.0)
+        if fin is not None and ss + dur > fin:  # recule dans le plan plutôt que d'en sortir
+            ss = max(debut, fin - dur)
+            if ss + dur > fin + 1e-6:
+                b["plan_trop_court"] = True
+        out.append(dict(b, at=round(start, 6), duration=round(dur, 6), source_start=round(ss, 6)))
+    if out:
+        out[-1]["duration"] = round(total - out[-1]["at"], 6)
+    return out
 
 
 def _anchor(timeline, at, mot):

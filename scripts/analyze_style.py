@@ -16,7 +16,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 import measure
-from common import die, find_transcript, list_videos, probe
+from common import die, find_transcript, list_videos, probe, tonemap
 
 MAX_IMAGES = 40
 SHEET_MAX = 24
@@ -46,7 +46,8 @@ CONFIRME_PAR = {"zooms.style": "zooms.style", "sous_titres.couleur": "sous_titre
 # métriques comparées entre références pour repérer une vidéo atypique
 DISPERSION = {"duree_moyenne_plan_s": "plan moyen (s)", "zooms_par_minute": "zooms/min", "lufs": "volume (LUFS)",
               "silence_max_s": "plus long silence (s)", "broll_part": "part de b-roll", "duree": "durée (s)",
-              "sous_titres_presence": "sous-titres"}
+              "sous_titres_presence": "sous-titres", "hook_plan_s": "plan de l'accroche (s)",
+              "mediane_plan_s": "plan médian (s)", "coupes_par_minute": "coupes/min"}
 STYLE_MD = """# Ma DA
 
 ## Observations
@@ -118,7 +119,7 @@ def _clip(path, t0, n, fps, y_pct, info, width=360):
     h = round(width * bh / W) // 2 * 2
     from common import ffmpeg
     r = subprocess.run([ffmpeg(), "-v", "error", "-ss", f"{max(0.0, t0):.3f}", "-i", str(path),
-                        "-vf", f"fps={fps},crop={W}:{bh}:0:{top},scale={width}:{h}", "-frames:v", str(n),
+                        "-vf", f"fps={fps},crop={W}:{bh}:0:{top},scale={width}:{h},{tonemap(info)}null", "-frames:v", str(n),
                         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
     a = r.stdout
     k = len(a) // (width * h * 3)
@@ -177,6 +178,11 @@ def measured_fields(mes):
         f[f"rythme.{k}"] = med(col(k))
     for k in measure.DEFAUT_RESPIRATION:
         f[f"rythme.{k}"] = med(sub("respiration", k))
+    qs = [m["plans_quantiles"] for m in ms if m.get("plans_quantiles")]
+    f["rythme.plans_quantiles"] = [round(statistics.median(c), 3) for c in zip(*qs)] if qs else None
+    f["rythme.hook_plan_s"] = med(col("hook_plan_s"))
+    f["cadrage.visage_largeur"] = med(sub("cadrage", "visage_largeur"))
+    f["cadrage.visage_y"] = med(sub("cadrage", "visage_y"))
 
     n_zooms = sum(len(m.get("zooms") or []) for m in ms)
     pool = Counter(z["type"] for m in ms for z in m.get("zooms") or [])
@@ -206,6 +212,13 @@ def measured_fields(mes):
             if accents else None
     f["sous_titres.emojis_par_minute"] = med(col("emojis_par_minute"))
 
+    tps = [x for x in col("true_peak_db") if x is not None]
+    f["audio.true_peak_max_db"] = max(tps) if tps else None
+    bords = [(m.get("cadrage") or {}).get("visage_bord") for m in ms]
+    bords = [x for x in bords if x is not None]
+    f["visage_bord_max"] = max(bords) if bords else None
+    noirs = [x for x in col("images_noires") if x is not None]
+    f["images_noires_max"] = max(noirs) if noirs else None
     lufs = med(col("lufs"))
     f["audio.lufs_cible"] = round(lufs, 1) if lufs is not None else None
     # musique = fond continu (niveau) ET tonal (notes) : un bruit de pièce a le niveau mais pas les notes

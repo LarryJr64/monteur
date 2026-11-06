@@ -59,7 +59,10 @@ def test_suivi_visage_reel(visage, tmp_path):
     cx = np.array([t[1] for t in centre])
     assert 0.44 < cx.mean() < 0.56 and 0.2 < np.mean([t[3] for t in centre]) < 0.45
     assert 0.55 < np.mean([t[1] for t in droite]) < 0.68  # l'invitée est à droite : le cadre la suit
-    assert np.abs(np.diff(cx)).max() < 0.004  # lissé + zone morte : aucune trépidation
+    # lissé + zone morte : aucune trépidation (pas d'aller-retour) ; un vrai mouvement de tête est suivi (≤ 0,006/image)
+    dx = np.diff(cx)
+    assert np.abs(dx).max() < 0.006
+    assert not any(a * b < 0 and min(abs(a), abs(b)) > 0.002 for a, b in zip(dx, dx[1:]))
     assert list((tmp_path / "visages").glob("visage_*.json"))  # détections en cache
     again = rf.face_track(visage, 2.0, 12.0, 30, cache_dir=tmp_path)
     assert again == centre
@@ -119,3 +122,17 @@ def test_couleur_sans_piste_video(tmp_path):
     ff("-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:a", "aac", str(src))
     assert rf.measure_colour(src) is None
     assert rf.colour_filter(None, {"luma": 0.5}) == ""
+
+
+def test_cadrage_de_la_da_zoom_de_base():
+    """Visage de 20 % de la hauteur d'un rush 1920x1080 ; la DA cadre le visage à 60 % de la largeur 9:16."""
+    track = [(i / 30, 0.5, 0.4, 0.20) for i in range(30)]
+    cw = 1080 * 1080 / 1920  # largeur du cadre 9:16 à zoom 1
+    z = rf.base_zoom(track, 1920, 1080, 1080, 1920, {"visage_largeur": 0.6})
+    assert abs(0.20 * 1080 / (cw / z) - 0.6) < 0.01  # visage à 60 % de la largeur après zoom
+    assert rf.base_zoom(track, 1920, 1080, 1080, 1920, {"visage_largeur": 0.2}) == 1.0  # rush déjà serré : pas de dézoom
+    assert rf.base_zoom(track, 1920, 1080, 1080, 1920, {"visage_largeur": 3.0}) == rf.CADRAGE_MAX  # borné
+    assert rf.base_zoom([], 1920, 1080, 1080, 1920, {"visage_largeur": 0.6}) == 1.0  # pas de visage
+    assert rf.base_zoom(track, 1920, 1080, 1080, 1920, None) == 1.0
+    x, y, cw2, ch2 = rf.crop_box(1920, 1080, 1080, 1920, 1.5, (0.5, 0.5), face=True, face_y=0.45)
+    assert abs((0.5 * 1080 - y) / ch2 - 0.45) < 0.01  # visage placé à la hauteur de la DA

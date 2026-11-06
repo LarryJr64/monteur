@@ -52,6 +52,35 @@ def run(args, capture=True):
     return (r.stdout or "") + (r.stderr or "")
 
 
+CADENCES = (23.976, 24, 25, 29.97, 30, 50, 59.94, 60)
+
+
+def _rate(s):
+    num, _, den = (s or "0/1").partition("/")
+    return float(num) / float(den or 1) if float(den or 1) else 0.0
+
+
+def _fps(v):
+    """Cadence d'un flux. Fréquence variable (téléphones) : la moyenne (46,8…) ne veut rien dire, on prend la
+    cadence nominale (r_frame_rate) ramenée à la cadence standard la plus proche."""
+    avg, nom = _rate(v.get("avg_frame_rate")), _rate(v.get("r_frame_rate"))
+    if not nom or abs(avg - nom) < 0.01:
+        return round(avg or nom, 3)
+    c = nom if nom <= 61 else avg
+    return min(CADENCES, key=lambda s: abs(s - c))
+
+
+def tonemap(info):
+    """Filtre (avec virgule finale) qui ramène une source HDR en SDR BT.709 ; vide pour une source SDR.
+    Sans lui, l'iPhone (HLG par défaut) sort délavé et la DA apprise sur ses vidéos aussi."""
+    if not (info or {}).get("hdr"):
+        return ""
+    # blanc de référence HDR = 203 nits (BT.2408) ; mobius garde gris moyen et blancs, adoucit seulement les hautes
+    # lumières (hable assombrissait tout : gris 18 % à 0,37 au lieu de 0,42)
+    return ("zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,tonemap=mobius:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv,format=yuv420p,")
+
+
 def probe(path):
     """Durée, taille, fps, présence audio d'un média."""
     out = run([ffprobe(), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)])
@@ -60,9 +89,8 @@ def probe(path):
     a = next((s for s in data["streams"] if s["codec_type"] == "audio"), None)
     info = {"duration": float(data["format"].get("duration", 0)), "has_audio": a is not None}
     if v:
-        num, den = v.get("avg_frame_rate", "0/1").split("/")
-        info.update(width=int(v["width"]), height=int(v["height"]),
-                    fps=round(float(num) / float(den), 3) if float(den) else 0.0)
+        info.update(width=int(v["width"]), height=int(v["height"]), fps=_fps(v),
+                    hdr=v.get("color_transfer") in ("arib-std-b67", "smpte2084"))  # HLG (iPhone) ou PQ
         # vidéos de téléphone : la rotation inverse largeur/hauteur
         rot = abs(int(next((sd.get("rotation", 0) for sd in v.get("side_data_list", []) if "rotation" in sd), 0)))
         if rot in (90, 270):

@@ -124,7 +124,9 @@ def fcpxml(items, infos, w, h, fps, name):
         elif c["zoom"] != 1.0:
             sub(e, "adjust-transform", scale=f"{c['zoom']:g} {c['zoom']:g}")
         mains.append((c, e))
-    lanes = {2: "1", "musique": "-1", "sfx": "-2"}
+    # la voix off prend la 1re piste sous la vidéo ; sans elle, numérotation d'avant (musique -1, bruitages -2)
+    vo = any(c["track"] == "voix" for c in items)
+    lanes = {2: "1", "voix": "-1", "musique": "-2" if vo else "-1", "sfx": "-3" if vo else "-2"}
     for b in (c for c in items if c["track"] in lanes):
         host = next(((c, e) for c, e in mains if c["at"] <= b["at"] < c["at"] + c["len"]), None)
         if not host:
@@ -136,7 +138,7 @@ def fcpxml(items, infos, w, h, fps, name):
                  tcFormat="NDF")
         if b["track"] == 2:
             sub(bb, "adjust-conform", type="fill")
-        else:
+        elif b.get("gain_db") is not None:
             sub(bb, "adjust-volume", amount=f"{b['gain_db']:g}dB")
     return root
 
@@ -225,7 +227,8 @@ def xmeml(items, infos, w, h, fps, name):
         for c in (c for c in items if c["track"] == t):
             clipitem(track, c, n, "video")
             n += 1
-    for t in (1, "musique", "sfx"):  # pistes son 1 voix, 2 musique, 3 bruitages
+    vo = any(c["track"] == "voix" for c in items)
+    for t in ("voix" if vo else 1, "musique", "sfx"):  # pistes son 1 voix, 2 musique, 3 bruitages
         track = sub(audio, "track")
         for c in (c for c in items if c["track"] == t and infos[c["src"]]["has_audio"]):
             clipitem(track, c, n, "audio")
@@ -267,6 +270,10 @@ def main():
 
     segs = captions.snapped_segments(edl, root)
     items = clips(edl, root, segs, fps, profile)
+    if edl.get("mode") == "voix_off":
+        # voix off : les plans (bout à bout) forment la piste principale, la voix passe en piste son connectée
+        for c in items:
+            c["track"] = {1: "voix", 2: 1}.get(c["track"], c["track"])
     infos = {}
     for c in items:
         if c["src"] not in infos:

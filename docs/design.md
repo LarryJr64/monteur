@@ -199,3 +199,41 @@ respiration médiane (±30 %), zooms/min (±35 %), part de b-roll (±40 %), sfx/
 ### Lancement des scripts depuis les skills
 `python "${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py" ...` — chaque script a `--help`, sort en code ≠ 0
 avec un message français clair en cas d'erreur, et imprime un résumé court (Claude lit stdout).
+
+## Version 3 — voix off, rythme en distribution, cadrage, coupes à 10 ms (06/11/26)
+
+Objectif : « je donne mes vidéos, puis un rush + une voix off (+ une consigne), et ça se monte exactement dans mon
+style », avec un abonnement Claude à 20 $ (Claude ne fait que le sens ; mesure, rythme, rendu et contrôles sont du code).
+Choix écartés : MCP (aucun gain de résultat, la transcription n'est lancée qu'une fois par montage), pilotage d'un
+logiciel de montage (fragile, payant ou non pilotable ; l'export FCPXML/xmeml suffit pour retoucher), modèle
+image-texte local (Claude lit une planche de 24 plans pour ~2 500 jetons : meilleur et moins lourd à installer).
+
+### Mesures ajoutées (measure.py → profile.json)
+- `rythme.plans_quantiles` : durées de plans à 10-25-50-75-90 % (médiane des références) ; `rythme.hook_plan_s` :
+  plan médian des 3 premières secondes. Le rythme d'un créateur est une distribution, pas une moyenne.
+- `cadrage.visage_largeur` (largeur du visage / largeur de l'image, 30e centile des plans face caméra = cadre de base)
+  et `cadrage.visage_y` (hauteur du centre du visage). `audio.true_peak_max_db`, `images_noires_max`.
+- `dispersion` couvre aussi plan médian, coupes/min, plan de l'accroche ; check accepte une valeur dans la plage
+  min-max de SES références (±5 %) même hors tolérance autour de la médiane.
+
+### Rendu
+- Cadrage : zoom de base par segment face caméra = `reframe.base_zoom` (visage ramené à `visage_largeur`, jamais de
+  dézoom, borné à 2,0) ; visage placé à `visage_y`. Non exporté dans le FCPXML (shortcut connu).
+- Coupes : `pacing.Envelope` (niveau du son par 10 ms) **élargit** une coupe qui mangerait une attaque ou une fin de
+  mot mal datée par la transcription ; ne resserre jamais.
+- Correction couleur finale mesurée sur ce qui est à l'écran (segments non recouverts + b-roll) et appliquée après
+  les b-roll. Un plan plus court que sa place garde sa dernière image (`tpad`).
+
+### Mode voix off (edl `"mode": "voix_off"`)
+- `scripts/plans.py rushs broll` → `.monteur/plans.json` (index), `plans.md` (une ligne par plan, description écrite
+  par Claude une fois, conservée aux relances), `plans_N.jpg` (planches de 24 vignettes numérotées).
+- `scripts/plans.py --voix voix/x.wav` → `.monteur/cadence.md` : créneaux au rythme de la DA (quantiles tirés dans un
+  ordre court/long, accroche à `hook_plan_s`), coupes sur des débuts de mots, de préférence entre deux phrases.
+- edl : `segments` = la voix (fichier son accepté : fond noir sous la voix) ; `broll` = un plan par créneau
+  `{"plan": "P12", "voix_t": <s dans la voix>, "mot": "..", "decalage": 0}`. pacing les met bout à bout sur toute la
+  durée (premier à 0, chacun jusqu'au suivant, dernier jusqu'à la fin), sans sortir du plan quand c'est possible.
+- check : pas de critère b-roll ni cadrage en voix off ; `images_noires` détecte une voix non couverte.
+
+### Contrôle v3 (check.py)
+`plans_courts_s` / `plans_longs_s` (quantiles 25/75 %, ±25 %), `hook_plan_s` (±30 %), `cadrage_visage` (±25 %),
+`images_noires`, `saturation_son` (true peak > max(0, références) + 0,1 dB).

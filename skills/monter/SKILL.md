@@ -1,6 +1,6 @@
 ---
 name: monter
-description: Monte les rushs bruts de rushs/ en une vidéo finie (reel, TikTok, Short) dans la DA de l'utilisateur à partir d'une phrase ou d'une trame — garde la meilleure prise, coupe les blancs et les ratés, construit le hook, ajoute zooms, sous-titres avec mots-clés et emojis, b-roll, bruitages, musique, couleur, contrôle le résultat et exporte aussi pour Premiere / Final Cut. À utiliser quand il dit « monte ma vidéo », « monte mes rushs », « fais-moi un reel / un TikTok / un short », « j'ai tourné, tu peux monter ? », « voici ma trame », « fais une version de 30 s », « vas-y direct ».
+description: Monte les rushs bruts de rushs/ (face caméra, ou plans illustratifs sous une voix off de voix/) en une vidéo finie (reel, TikTok, Short) dans la DA de l'utilisateur à partir d'une phrase ou d'une trame — garde la meilleure prise, coupe les blancs et les ratés, construit le hook, ajoute zooms, sous-titres avec mots-clés et emojis, b-roll, bruitages, musique, couleur, contrôle le résultat et exporte aussi pour Premiere / Final Cut. À utiliser quand il dit « monte ma vidéo », « monte mes rushs », « fais-moi un reel / un TikTok / un short », « j'ai tourné, tu peux monter ? », « voici ma trame », « fais une version de 30 s », « vas-y direct », « monte ma voix off sur mes rushs ».
 allowed-tools: Bash(python *) Bash(python3 *) Bash(py *) Read Write Edit Glob
 ---
 
@@ -21,6 +21,14 @@ le sujet est introuvable. « vas-y direct », « sans me demander » = pas de va
 `doctor.py` ; `[!!]` → accord puis `doctor.py --installer` (voir apprendre-ma-da). Pas de `ma-da/profile.json` :
 propose d'apprendre sa DA (5-10 vidéos) ; s'il refuse, style reel standard (plan ~2 s, sous-titres blancs 3 mots,
 mot-clé jaune, zooms punch 1 coupe sur 2) et dis-le. `rushs/` vide : dis-lui d'y déposer ses fichiers, stop.
+
+**Commandes** : une commande par appel, chemin complet du script, sans `cd`, sans variable, sans `&&` ni script
+temporaire (sinon des demandes d'autorisation bloquent le montage). **Économe** (beaucoup ont un abonnement à 20 $) : ne lis jamais un transcript `.json` en entier (Grep le
+mot voulu), lis `takes.md` / `cadence.md` / `plans.md`, une planche d'images une seule fois, pas de vue en double.
+
+**Quel montage ?** Un fichier son dans `voix/` (ou une voix off citée par lui) **et** des rushs sans personne qui
+parle face caméra = **voix off** → section 3 bis. Sinon (il parle dans ses rushs) = face caméra → sections 2-3.
+Doute : un coup d'œil (`timeline_view.py` sur un rush) tranche.
 
 ## 2. Transcrire et lire
 ```
@@ -51,12 +59,17 @@ long : retire les répétitions d'idée, puis les exemples secondaires, jamais h
 pas, préviens. **Fin** : une phrase qui ferme la boucle ou le CTA de sa DA (`style_verbal.cta`), `"note": "cta"`,
 coupe sèche après.
 
-**Coupes.** `start` = début du 1er mot − 0,05 s, `end` = fin du dernier mot + 0,10 s (mots : `.monteur/
-transcripts/<nom>.json`, Read). Le rendu recale ensuite tout sur sa respiration (`rythme.respiration_*`) :
+**Coupes.** `start` = début du 1er mot − 0,05 s, `end` = fin du dernier mot + 0,10 s : prends les bornes des
+phrases dans `takes.md` ; pour couper au milieu d'une phrase, **Grep** le mot dans `.monteur/transcripts/<nom>.json`
+(jamais Read du fichier entier : des dizaines de milliers de tokens). Le rendu recale ensuite tout sur sa respiration (`rythme.respiration_*`) :
 ne compresse pas les pauses à la main, coupe juste ce qui doit partir.
 
+**Cadrage.** Le rendu cadre seul le visage comme dans ses vidéos (`cadrage` du profil : taille du visage, hauteur
+des yeux) : n'ajoute pas de zoom pour « serrer » le plan, garde les zooms pour le rythme.
+
 **Zooms (identiques à sa DA).** Un plan = un segment ou un changement de zoom ; vise `rythme.duree_moyenne_plan_s`
-(un segment > ~1,6× se découpe en deux segments contigus). Cadence : un zoom toutes les `zooms.une_coupe_sur`
+(un segment > ~1,6× se découpe en deux segments contigus), avec **sa répartition** `rythme.plans_quantiles` (des
+plans courts et des longs, pas tous pareils) et des plans de `rythme.hook_plan_s` dans les 3 premières secondes. Cadence : un zoom toutes les `zooms.une_coupe_sur`
 coupes, ~`zooms.par_minute`/min. Mélange selon `zooms.types` : `punch` (rampe `rampe_s`, ×`intensite`, phrases
 qui comptent), `doux` (poussée lente sur toute une phrase calme), `crash` (×1,25-1,35, 1 à 3 par vidéo, sur LE
 chiffre / la chute), `cut` = zoom sec à la coupe (mets `zoom` sans `zoom_type`). Toujours sur un **début de phrase**
@@ -87,6 +100,27 @@ ailleurs), types de `sfx_types` (fichiers d'`assets/sfx/` : whoosh, swoosh, pop,
 
 **Doute** (deux prises proches, rire, geste, mot coupé) : `timeline_view.py rushs/a.mp4 --de 12 --a 16` + Read.
 
+## 3 bis. Voix off sur ses rushs (si c'est ce mode)
+1. `transcribe.py voix` (la voix seule) puis `plans.py rushs broll` (les dossiers qui existent) : découpe les rushs en
+   plans numérotés → `.monteur/plans.md` + planches `.monteur/plans_1.jpg`, `_2.jpg`…
+2. Lis chaque planche **une fois**, puis écris en **un seul Write** `.monteur/descriptions.txt`, une ligne par plan :
+   `P12: mains versant un café, gros plan` (3-8 mots concrets : ce qu'on voit, cadrage). Pas de script. Déjà décrits
+   (relance) : ne relis pas les planches.
+3. Garde les bonnes phrases de la voix (prises ratées, hésitations : mêmes règles qu'en 3) → `segments` sur le
+   fichier de la voix (souvent un seul segment du premier au dernier mot gardé). Puis
+   `plans.py --voix voix/<fichier>` → `.monteur/cadence.md` : les créneaux de plans **au rythme de sa DA** (accroche
+   plus rapide, alternance court/long), chaque coupe sur un début de mot. Ne change pas ce découpage : c'est son rythme.
+4. Pour chaque créneau, choisis le plan qui **illustre ce qui est dit** à ce moment : l'objet ou l'action nommés
+   d'abord (« café » → le plan du café) ; une idée abstraite → l'émotion ou le geste qui va avec (« calme » → mer,
+   forêt) ; l'accroche → le plan le plus fort visuellement. Jamais deux fois le même plan (s'il en manque, un autre
+   moment du même plan avec `"decalage"` en s), **jamais deux plans de la même scène l'un après l'autre** (même
+   `scène` dans plans.md : la coupe ne se verrait pas — alterne A, B, A, C…), jamais un plan `flou` s'il y a mieux,
+   varie les cadrages (large / serré). Si la DA zoome, une poussée `"zoom_type": "doux", "zoom": <intensite>` sur
+   ~1 plan sur `zooms.une_coupe_sur`. Un créneau = une entrée de `broll` : `{"plan": "P12", "voix_t": <début du créneau>, "mot": "<son mot>"}`.
+5. edl : `"mode": "voix_off"`, `segments` = la voix, `broll` = tous les créneaux dans l'ordre, sous-titres / mots-clés
+   / musique / couleur comme sa DA (pas de zooms de visage). Le rendu met les plans bout à bout sur toute la voix,
+   chacun sur son mot, sans jamais d'image noire, et le son des rushs est coupé (seule la voix compte).
+
 Écris `.monteur/edl.json` (Write) **exactement** dans ce format :
 ```json
 {"version": 2, "output": "sorties/<sujet-court>.mp4",
@@ -101,6 +135,8 @@ ailleurs), types de `sfx_types` (fichiers d'`assets/sfx/` : whoosh, swoosh, pop,
  "audio": {"nettoyage_voix": "auto"},
  "couleur": "auto"}
 ```
+Voix off : `{"version": 3, "mode": "voix_off", ..., "segments": [{"source": "voix/vo.wav", "start": 0.4, "end": 38.2,
+"mots_cles": [..]}], "broll": [{"plan": "P3", "voix_t": 0.4, "mot": "Tu"}, {"plan": "P7", "voix_t": 1.9, "mot": "café"}, ..]}`.
 `segments` dans l'ordre de sortie, temps **dans le rush** ; `zoom_type` ∈ aucun|doux|punch|crash (absent = zoom
 sec) ; `broll.at`, `sfx.at`, `titles.at` = temps **dans la vidéo finale** ; `format` = `profile.format` ;
 `captions` = `sous_titres.actif` ; `music` peut être `null`, les listes `[]`. `note` : `hook`, `cta`, `garde`
@@ -127,7 +163,9 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/check.py" sorties/<nom>.mp4 --duree-cible 
 ajoute/retire en début de phrase ; mot coupé → bornes sur les mots ; b-roll sur hook → décale ; couleur →
 `"couleur": "auto"` ; loudness → c'est le rendu, relance), re-rends, re-contrôle. **2 boucles maximum**, puis livre
 en disant honnêtement ce qui reste hors tolérance et pourquoi.
-Puis **regarde** comme un monteur : `timeline_view.py sorties/<nom>.mp4 --de 0 --a <durée>` et Read ; vérifie sur
+Écarts du rythme (`plans_courts_s`, `plans_longs_s`, `hook_plan_s`) en voix off : relance `plans.py --voix` puis
+réattribue ; en face caméra : découpe/fusionne des segments, zooms. `images_noires` = un trou : un plan manque.
+Puis **regarde** comme un monteur (une seule planche) : `timeline_view.py sorties/<nom>.mp4 --de 0 --a <durée>` et Read ; vérifie sur
 4-6 moments (hook, un zoom, un b-roll, un mot-clé, la fin) : sous-titres lisibles, pas de mot tronqué
 (« L 'HORMONE »), mot-clé dans la bonne couleur, emoji au-dessus du texte, b-roll au bon mot, visage cadré dans
 les zooms. Un défaut visible → corrige avant de livrer (compte dans les 2 boucles).

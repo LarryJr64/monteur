@@ -55,15 +55,24 @@ def edl_measures(edl, root, profile):
     h = hook_end(edl, profile)
     br = edl.get("broll") or []
     minutes = max(total, 1e-6) / 60
-    return {"words": words, "mots_coupes": coupes, "hook_fin_s": round(h, 2),
+    colles = [b.get("plan") for a, b in zip(br, br[1:]) if a.get("scene") and a.get("scene") == b.get("scene")]         if edl.get("mode") == "voix_off" else []
+    return {"words": words, "mots_coupes": coupes, "hook_fin_s": round(h, 2), "plans_meme_scene": colles,
             "broll_sur_hook": [b for b in br if b["at"] < h - 0.05],
             "broll_part": round(sum(b["duration"] for b in br) / max(total, 1e-6), 3),
             "sfx_par_minute": round(len(edl.get("sfx") or []) / minutes, 2)}
 
 
+def dans_plage(profile, key, v, marge=0.05):
+    """La valeur tombe dans la plage de SES vidéos (min-max des références, ±5 %) : c'est son style, même si elle
+    s'écarte de la médiane. Faux sans plage connue (moins de 3 références)."""
+    d = (profile.get("dispersion") or {}).get(key)
+    return bool(d) and v is not None and d["min"] * (1 - marge) <= v <= d["max"] * (1 + marge)
+
+
 def compare(m, profile, duree_cible=None, edl=None, e=None):
     ecarts = []
     e = e or {}
+    voix_off = (edl or {}).get("mode") == "voix_off"
 
     def ecart(critere, attendu, mesure, tolerance, conseil):
         ecarts.append({"critere": critere, "attendu": attendu, "mesure": mesure,
@@ -73,13 +82,56 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
     z = profile.get("zooms", {})
     cible = r.get("duree_moyenne_plan_s")
     plan = m["duree_moyenne_plan_s"]
-    if cible and abs(plan - cible) > 0.15 * cible:  # mesure exacte (0 % d'erreur sur références) : on serre
+    if cible and abs(plan - cible) > 0.15 * cible and not dans_plage(profile, "duree_moyenne_plan_s", plan):
         besoin = round(m["duree"] / cible) - len(m["plans"])
         conseil = (f"plans trop longs : ajouter ~{besoin} coupe(s) (couper plus serré, retirer respirations "
                    f"et hésitations, ou alterner des punch-ins ×{z.get('intensite', 1.15)})"
                    if besoin > 0 else
                    f"plans trop courts : retirer ~{-besoin} coupe(s) (fusionner des segments voisins, moins de zooms)")
         ecart("duree_moyenne_plan_s", cible, plan, "±15%", conseil)
+
+    q, mq = r.get("plans_quantiles"), m.get("plans_quantiles")
+    if q and mq and len(q) == 5 and len(m["plans"]) >= 6:
+        for i, nom in ((1, "courts"), (3, "longs")):  # 25 % et 75 % : la forme du rythme, pas seulement sa moyenne
+            if abs(mq[i] - q[i]) > 0.25 * q[i]:
+                plus = mq[i] > q[i]
+                ecart(f"plans_{nom}_s", q[i], mq[i], "±25%",
+                      f"tes plans {nom} durent {fr(q[i])} s, ceux de la vidéo {fr(mq[i])} s : "
+                      + ("couper plus souvent " if plus else "laisser durer davantage ")
+                      + ("les plans les plus courts" if i == 1 else "les plans les plus longs")
+                      + " (alterne court / long comme dans tes vidéos)")
+    hp, mhp = r.get("hook_plan_s"), m.get("hook_plan_s")
+    if hp and mhp and abs(mhp - hp) > 0.3 * hp and not dans_plage(profile, "hook_plan_s", mhp):
+        ecart("hook_plan_s", hp, mhp, "±30%",
+              f"rythme de l'accroche (3 premières s) : un plan toutes les {fr(mhp)} s au lieu de {fr(hp)} s → "
+              + ("ajouter une coupe ou un zoom dans les 3 premières secondes" if mhp > hp else
+                 "moins de coupes dans les 3 premières secondes"))
+
+    cad, mcad = profile.get("cadrage") or {}, m.get("cadrage") or {}
+    if not voix_off and cad.get("visage_largeur") and mcad.get("visage_largeur"):
+        cv, mv = cad["visage_largeur"], mcad["visage_largeur"]
+        if abs(mv - cv) > 0.25 * cv:
+            ecart("cadrage_visage", cv, mv, "±25%",
+                  f"visage {'trop gros' if mv > cv else 'trop petit'} dans le cadre ({round(100 * mv)} % de la largeur "
+                  f"au lieu de {round(100 * cv)} %) : le rendu cadre d'après profile.cadrage ; vérifier que le visage "
+                  "est détecté (zoom_center \"visage\")" + (" — le rush est peut-être déjà plus serré que ta DA"
+                                                             if mv > cv else ""))
+
+    bord_ref, bord = profile.get("visage_bord_max") or 0.0, (mcad or {}).get("visage_bord") or 0.0
+    # shortcut: boîte du visage sans les yeux (lunettes au bord comptées) → seuil large ; points des yeux YuNet si faux positifs
+    if not voix_off and bord > max(0.20, bord_ref + 0.10):
+        ecart("visage_coupe", bord_ref, bord, "comme tes vidéos",
+              f"visage coupé par le bord du cadre sur {round(100 * bord)} % des plans face caméra (un œil sort) : "
+              "zoom trop fort ou visage mal suivi → baisser le zoom de ces segments ou zoom_center \"visage\"")
+    noir_max = profile.get("images_noires_max") or 0.0
+    if (m.get("images_noires") or 0.0) > noir_max + 0.01:
+        ecart("images_noires", noir_max, m["images_noires"], "comme tes vidéos",
+              f"{round(100 * m['images_noires'])} % d'images noires : un trou dans le montage (plan manquant, "
+              "b-roll trop court ou voix off non couverte) → vérifier les plans de l'edl")
+    tp, tp_ref = m.get("true_peak_db"), (profile.get("audio") or {}).get("true_peak_max_db")
+    if tp is not None and tp > max(0.0, tp_ref if tp_ref is not None else -1.0) + 0.1:
+        ecart("saturation_son", f"≤ {fr(max(0.0, tp_ref or -1.0), 1)} dBTP", tp, "pas de saturation",
+              "le son sature (crêtes au-dessus de 0 dB) : relancer le rendu ; si ça persiste, baisser la musique")
 
     smax = r.get("silence_max_s")
     if smax is not None and m["silence_max_s"] > smax + 0.15:
@@ -119,8 +171,14 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
             ecart(k, v, got, "exact", f"rendre en {profile['format'].get('width')}x{profile['format'].get('height')} "
                   f"à {profile['format'].get('fps')} i/s (edl.json → format)")
 
+    if e.get("plans_meme_scene"):
+        ecart("plans_meme_scene", 0, e["plans_meme_scene"], "aucun",
+              "deux plans de la même scène se suivent (la coupe ne se voit pas, le plan paraît trop long) : "
+              f"remplacer {', '.join(map(str, e['plans_meme_scene']))} par un plan d'une autre scène (plans.md)")
+
     zpm = z.get("par_minute")
-    if zpm is not None and (zpm > 0 or m["zooms_par_minute"] > 2):
+    # voix off : les zooms de la DA sont des zooms sur le visage, sans objet sur des plans d'illustration
+    if not voix_off and zpm is not None and (zpm > 0 or m["zooms_par_minute"] > 2):
         if abs(m["zooms_par_minute"] - zpm) > max(0.35 * zpm, 1.0):
             n = round(abs(m["zooms_par_minute"] - zpm) * m["duree"] / 60)
             mix = ", ".join(f"{k} {round(100 * v)} %" for k, v in (z.get("types") or {}).items())
@@ -158,14 +216,14 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
 
     b = profile.get("broll", {})
     part = m.get("broll_part") if m.get("broll_part") is not None else e.get("broll_part")
-    if b.get("part_pct") and b["part_pct"] >= 0.05 and part is not None and abs(part - b["part_pct"]) > 0.4 * b["part_pct"]:
+    if not voix_off and b.get("part_pct") and b["part_pct"] >= 0.05 and part is not None and abs(part - b["part_pct"]) > 0.4 * b["part_pct"]:
         plus = part > b["part_pct"]
         ecart("broll_part", b["part_pct"], part, "±40%",
               f"{'trop' if plus else 'pas assez'} de b-roll ({round(100 * part)} % du temps au lieu de "
               f"{round(100 * b['part_pct'])} %) : " + ("retirer les plans de coupe les moins liés à un mot"
                                                        if plus else "poser des b-roll sur les noms concrets dits "
                                                        f"(~{fr(b.get('duree_moy_s') or 1.8, 1)} s chacun, champ \"mot\")"))
-    if e.get("broll_sur_hook") and b.get("jamais_sur_hook", True):
+    if not voix_off and e.get("broll_sur_hook") and b.get("jamais_sur_hook", True):
         ecart("broll_sur_hook", "aucun", [x["source"] for x in e["broll_sur_hook"]], "0 avant la fin du hook",
               f"le hook (0-{fr(e['hook_fin_s'], 1)} s) doit rester sur le visage : décaler ou retirer ces b-roll")
 

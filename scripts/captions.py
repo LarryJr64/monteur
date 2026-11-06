@@ -174,6 +174,27 @@ def make_blocks(words, per_block=3):
     return res
 
 
+def dose_keywords(blocks, part):
+    """Mots-clés colorés sur `part` des blocs, pas plus (la DA mesurée) : si Claude en a proposé trop, on garde en
+    priorité les chiffres, puis des blocs répartis régulièrement. Jamais d'ajout (le choix des mots reste à Claude)."""
+    with_kw = [i for i, b in enumerate(blocks) if any(w.get("cle") for w in b["words"])]
+    want = round(part * len(blocks)) if part else None
+    if want is None or len(with_kw) <= want * 1.1 + 0.5:
+        return blocks
+    chiffres = [i for i in with_kw if any(w.get("cle") and re.search(r"\d", w["w"]) for w in blocks[i]["words"])]
+    keep = set(chiffres[:want])
+    others = [i for i in with_kw if i not in keep]
+    n = want - len(keep)
+    if n > 0:
+        keep |= {others[round(k * (len(others) - 1) / max(1, n - 1))] for k in range(n)} if n > 1 else {others[len(others) // 2]}
+    out = []
+    for i, b in enumerate(blocks):
+        if i in with_kw and i not in keep:
+            b = dict(b, words=[{k: v for k, v in w.items() if k != "cle"} for w in b["words"]])
+        out.append(b)
+    return out
+
+
 # ---------- ASS ----------
 
 def ass_color(hexa, alpha=0):
@@ -248,7 +269,11 @@ def layout(words, st, width, height, face_at=None):
     bottom = (0.80 if safe else 0.94) * height
     y0 = st["position_y_pct"] * height
     out = []
-    for blk in make_blocks(words, int(st["mots_par_bloc"])):
+    part = st.get("mots_cles_part_blocs")
+    blocks = make_blocks(words, int(st["mots_par_bloc"]))
+    if part and part < 0.85:  # au-delà : un mot actif par bloc (karaoké), pas un dosage de mots-clés
+        blocks = dose_keywords(blocks, part)
+    for blk in blocks:
         ws = blk["words"]
         toks = [w["w"].upper() if st["majuscules"] else w["w"] for w in ws]
         kw = next((i for i, w in enumerate(ws) if w.get("cle")), None)
