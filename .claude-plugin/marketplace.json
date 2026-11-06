@@ -1,0 +1,12 @@
+{
+  "name": "monteur",
+  "description": "Le monteur vidéo dans ta DA",
+  "owner": { "name": "LarryJr64" },
+  "plugins": [
+    {
+      "name": "monteur",
+      "source": "./",
+      "description": "Apprend ta DA de montage puis monte tes rushs dans ton style."
+    }
+  ]
+}

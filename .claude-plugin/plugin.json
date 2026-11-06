@@ -1,0 +1,10 @@
+{
+  "name": "monteur",
+  "displayName": "Monteur",
+  "version": "0.2.0",
+  "description": "Apprend ta DA de montage à partir de tes vidéos, puis monte tes rushs (reels, TikTok) dans ton style à partir d'une phrase.",
+  "author": { "name": "LarryJr64" },
+  "repository": "https://github.com/LarryJr64/monteur",
+  "license": "MIT",
+  "keywords": ["montage", "video", "reels", "tiktok", "sous-titres", "ffmpeg", "whisper"]
+}

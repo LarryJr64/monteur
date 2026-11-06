@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+# dossiers de travail si on teste depuis la racine du dépôt
+.monteur/
+mes-videos/
+rushs/
+broll/
+musique/
+ma-da/
+sorties/
+*.mp4
+*.mov
+!tests/**/*.mp4
