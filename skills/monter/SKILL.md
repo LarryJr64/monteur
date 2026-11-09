@@ -1,6 +1,6 @@
 ---
 name: monter
-description: Monte les rushs bruts de rushs/ (face caméra, ou plans illustratifs sous une voix off de voix/) en une vidéo finie (reel, TikTok, Short) dans la DA de l'utilisateur à partir d'une phrase ou d'une trame — garde la meilleure prise, coupe les blancs et les ratés, construit le hook, ajoute zooms, sous-titres avec mots-clés et emojis, b-roll, bruitages, musique, couleur, contrôle le résultat et exporte aussi pour Premiere / Final Cut. À utiliser quand il dit « monte ma vidéo », « monte mes rushs », « fais-moi un reel / un TikTok / un short », « j'ai tourné, tu peux monter ? », « voici ma trame », « fais une version de 30 s », « vas-y direct », « monte ma voix off sur mes rushs ».
+description: Monte les rushs bruts de rushs/ (face caméra, ou plans illustratifs sous une voix off de voix/) en une vidéo finie (reel, TikTok, Short) dans la DA de l'utilisateur à partir d'une phrase ou d'une trame — garde la meilleure prise, coupe les blancs et les ratés, construit le hook, ajoute zooms, sous-titres avec mots-clés et emojis, b-roll, bruitages, musique, couleur, contrôle le résultat et exporte aussi pour Premiere / Final Cut. À utiliser quand il dit « monte ma vidéo », « monte mes rushs », « fais-moi un reel / un TikTok / un short », « j'ai tourné, tu peux monter ? », « voici ma trame », « fais une version de 30 s », « vas-y direct », « monte ma voix off sur mes rushs », « j'ai tout mis dans un dossier », « voici mes fichiers en vrac ».
 allowed-tools: Bash(python *) Bash(python3 *) Bash(py *) Read Write Edit Glob
 ---
 
@@ -12,7 +12,9 @@ Chaque script a `--help`. N'appelle jamais ffmpeg toi-même : pour voir une imag
 `timeline_view.py <fichier> --de 0 --a 999` puis Read. Parle simple, sans jargon.
 
 ## 0. Le brief
-Tire de sa phrase (ou de sa **trame** : liste d'idées / plan écrit → c'est l'ordre et le contenu à suivre) :
+Tire de sa phrase (ou de sa **trame** : liste d'idées / plan écrit, dictée ou dans un fichier `trame.txt`/`.md`
+du dossier → c'est l'ordre et le contenu à suivre ; ses demandes précises — « montre la tasse quand je parle du
+café », « finis sur le coucher de soleil » — passent avant tes choix ; pas de trame : la structure de sa DA) :
 **sujet**, **durée cible** (sinon `style_verbal.duree_typique_s`, sinon « le plus court qui garde tout le fond »),
 **plateforme** (reel/TikTok/Short = 9:16), **ton**. Pas de question si tu peux décider ; une seule au maximum si
 le sujet est introuvable. « vas-y direct », « sans me demander » = pas de validation du plan.
@@ -20,13 +22,20 @@ le sujet est introuvable. « vas-y direct », « sans me demander » = pas de va
 ## 1. Préparer
 `doctor.py` ; `[!!]` → accord puis `doctor.py --installer` (voir apprendre-ma-da). Pas de `ma-da/profile.json` :
 propose d'apprendre sa DA (5-10 vidéos) ; s'il refuse, style reel standard (plan ~2 s, sous-titres blancs 3 mots,
-mot-clé jaune, zooms punch 1 coupe sur 2) et dis-le. `rushs/` vide : dis-lui d'y déposer ses fichiers, stop.
+mot-clé jaune, zooms punch 1 coupe sur 2) et dis-le.
+
+**Fichiers en vrac** (tout dans un même dossier, pas dans `rushs/`/`voix/`/`broll/`/`musique/`) : ne trie pas à la
+main, ne déplace rien. `transcribe.py <dossier>` puis `trier.py <dossier>` → `.monteur/tri.md` : chaque fichier
+(`parle` = quelqu'un parle à l'image, `plan` = image sans parole, `voix off`, `musique`, `trame`) et le mode. Un
+`?` → un `timeline_view.py` de ce fichier tranche. Ensuite, partout plus bas : rushs = fichiers `parle`, broll =
+`plan`, voix = `voix off`, musique = `musique` (chemins `<dossier>/<fichier>`, pas de transcription en double).
+Mode « aucune voix » : pas géré, dis-le et demande une voix off. Rien du tout à monter : dis-lui où déposer, stop.
 
 **Commandes** : une commande par appel, chemin complet du script, sans `cd`, sans variable, sans `&&` ni script
 temporaire (sinon des demandes d'autorisation bloquent le montage). **Économe** (beaucoup ont un abonnement à 20 $) : ne lis jamais un transcript `.json` en entier (Grep le
 mot voulu), lis `takes.md` / `cadence.md` / `plans.md`, une planche d'images une seule fois, pas de vue en double.
 
-**Quel montage ?** Un fichier son dans `voix/` (ou une voix off citée par lui) **et** des rushs sans personne qui
+**Quel montage ?** Fichiers en vrac : le mode de `tri.md`. Sinon, un fichier son dans `voix/` (ou une voix off citée par lui) **et** des rushs sans personne qui
 parle face caméra = **voix off** → section 3 bis. Sinon (il parle dans ses rushs) = face caméra → sections 2-3.
 Doute : un coup d'œil (`timeline_view.py` sur un rush) tranche.
 
@@ -89,6 +98,8 @@ segment au plus, uniquement parmi ceux d'`assets/emoji/` (`"emoji": "☕"`). Jam
 total ≈ `broll.part_pct`. Jamais sur le hook ni le CTA, jamais sur une phrase qui a un punch-in. DA sans
 b-roll (`part_pct` < 0,03) : **aucun**, même si `broll/` contient des fichiers (ils changeraient le rythme et le
 style) — sauf s'il le demande ; dis-le en une ligne à la livraison. N'invente jamais un fichier.
+Noms sans indice (`IMG_1234.mov`, fichiers `plan` du vrac) : `plans.py <ces fichiers>` puis décris les planches
+comme en 3 bis (étapes 1-2) ; un b-roll = `source` et `source_start` du plan choisi dans `plans.md`.
 **Bruitages.** Seulement si `audio.sfx_par_minute` > 0 **et** confirmé par l'utilisateur (`audio.sfx_par_minute`
 dans `verrous` ; sinon c'est une estimation du code, peu fiable : aucun bruitage) : sur les entrées de b-roll et les crash zooms (pas
 ailleurs), types de `sfx_types` (fichiers d'`assets/sfx/` : whoosh, swoosh, pop, click, ding, impact, riser),
@@ -101,7 +112,8 @@ ailleurs), types de `sfx_types` (fichiers d'`assets/sfx/` : whoosh, swoosh, pop,
 **Doute** (deux prises proches, rire, geste, mot coupé) : `timeline_view.py rushs/a.mp4 --de 12 --a 16` + Read.
 
 ## 3 bis. Voix off sur ses rushs (si c'est ce mode)
-1. `transcribe.py voix` (la voix seule) puis `plans.py rushs broll` (les dossiers qui existent) : découpe les rushs en
+1. `transcribe.py voix` (la voix seule) puis `plans.py rushs broll` (les dossiers qui existent ; en vrac : les
+   fichiers `plan` de tri.md, un par argument, la voix déjà transcrite) : découpe les rushs en
    plans numérotés → `.monteur/plans.md` + planches `.monteur/plans_1.jpg`, `_2.jpg`…
 2. Lis chaque planche **une fois**, puis écris en **un seul Write** `.monteur/descriptions.txt`, une ligne par plan :
    `P12: mains versant un café, gros plan` (3-8 mots concrets : ce qu'on voit, cadrage). Pas de script. Déjà décrits

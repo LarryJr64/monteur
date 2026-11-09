@@ -74,6 +74,17 @@ seulement si ton style change.
 Il regarde tous tes plans, découpe ta voix au rythme de ta DA et pose sur chaque passage le plan qui colle à ce
 que tu dis (le café quand tu parles du café), sans jamais réutiliser le même plan ni laisser d'écran noir.
 
+**Tout en vrac** : pas envie de trier ? Mets tous tes fichiers (rushs, plans, voix off, musique, et si tu veux
+un `trame.txt`) dans un seul dossier, par exemple `depot/`, et dis
+> J'ai tout mis dans depot, monte-moi ça : [ce que tu veux, même dicté à l'oral].
+
+Il reconnaît seul ce qu'est chaque fichier (toi qui parles, un plan, ta voix off, une musique) et choisit le bon
+montage.
+
+**Changer de style** : pas besoin que ce soient tes vidéos. Mets 5 à 10 vidéos d'un style qui t'inspire (du même
+style entre elles) dans `inspi/` et dis « Apprends ce style à partir de mes inspis » : tes montages suivront ce
+style.
+
 Tu peux aussi donner ta trame (« d'abord le problème, puis mes 3 conseils, finis sur abonne-toi »). Il te
 montre le plan ; tu valides ou tu dis « enlève la 2e phrase ». Pressé ? Ajoute « vas-y direct ». La vidéo
 arrive dans `sorties/`.

@@ -1,6 +1,6 @@
 ---
 name: apprendre-ma-da
-description: Apprend la DA (direction artistique) de montage de l'utilisateur à partir de 5 à 10 de ses vidéos déjà montées dans mes-videos/ — rythme, respiration, zooms, sous-titres, mots-clés colorés, emojis, b-roll, bruitages, musique, couleur, hook, CTA, ton — et l'enregistre dans ma-da/. À utiliser quand il dit « apprends mon style », « analyse mes vidéos », « voici ma DA », « apprends comment je monte », « regarde mes vidéos », « mets à jour mon style », « monte comme moi / comme [créateur] », ou avant un premier montage si ma-da/profile.json n'existe pas.
+description: Apprend la DA (direction artistique) de montage de l'utilisateur à partir de 5 à 10 de ses vidéos déjà montées dans mes-videos/ — rythme, respiration, zooms, sous-titres, mots-clés colorés, emojis, b-roll, bruitages, musique, couleur, hook, CTA, ton — et l'enregistre dans ma-da/. À utiliser quand il dit « apprends mon style », « analyse mes vidéos », « voici ma DA », « apprends comment je monte », « regarde mes vidéos », « mets à jour mon style », « monte comme moi / comme [créateur] », « voici mes inspis », « je veux ce style-là », ou avant un premier montage si ma-da/profile.json n'existe pas.
 allowed-tools: Bash(python *) Bash(python3 *) Bash(py *) Read Write Edit Glob
 ---
 
@@ -21,6 +21,9 @@ première fois), OK ? »), puis `doctor.py --installer` (délai long : 10 min). 
 reste introuvable après l'installation : fermer et rouvrir Claude, puis relancer.
 `mes-videos/` doit contenir **5 à 10** vidéos montées, représentatives, au format qu'il veut produire. Moins
 de 5 : explique que la DA sera moins fiable (2 minimum) ; 0 : dis-lui d'en déposer et arrête-toi.
+**Inspirations** (vidéos d'autres créateurs, pour changer de style) : c'est pareil, dans le dossier qu'il nomme
+(`inspi/`…) → `analyze_style.py inspi`. Elles doivent se ressembler entre elles (même style visé) : une vidéo
+atypique = une autre DA, propose de la retirer. Le cadrage appris est celui des inspirations : dis-le.
 
 ## 2. Mesurer
 ```
