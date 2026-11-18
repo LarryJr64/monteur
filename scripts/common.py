@@ -30,6 +30,43 @@ def _find(name):
     die(f"{name} introuvable. Lance : python scripts/doctor.py (ou installe ffmpeg : winget install Gyan.FFmpeg)")
 
 
+def ram_libre_go():
+    """Mémoire disponible (Go) ; None si inconnue. Sans dépendance : Windows, Linux, Mac."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class M(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("c", ctypes.c_ulong)] + [(n, ctypes.c_ulonglong) for n in (
+                    "tot", "dispo", "ptot", "pdispo", "vtot", "vdispo", "x")]
+            m = M()
+            m.l = ctypes.sizeof(M)
+            return m.dispo / 2**30 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+        if Path("/proc/meminfo").exists():
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2**20
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout  # Mac
+        page = 16384 if "16384" in out.splitlines()[0] else 4096
+        pages = sum(int(l.split(":")[1].strip(" .")) for l in out.splitlines()
+                    if l.startswith(("Pages free", "Pages inactive", "Pages speculative")))
+        return pages * page / 2**30
+    except Exception:
+        return None
+
+
+# Ordinateurs à peu de mémoire (ou déjà chargés) : un seul encodage à la fois et ffmpeg sur 2-4 cœurs.
+# MONTEUR_ECONOME=1 / 0 force le mode ; sinon il s'active sous 4 Go libres au lancement.
+_r = ram_libre_go()
+ECONOME = os.environ.get("MONTEUR_ECONOME", "1" if _r is not None and _r < 4 else "0") == "1"
+PARALLELE = 1 if ECONOME else 3          # travaux ffmpeg lancés en même temps
+FF_THREADS = ["-threads", "2"] if ECONOME else ["-threads", "4"]  # par décodeur / encodeur (12 cœurs = 12 fils et autant d'images en mémoire)
+
+
+MUSIQUE_DB_DEFAUT = -22  # musique sous la voix (dB) quand ni l'edl ni la DA ne donnent de niveau
+LUFS_DIFFUSION = -14.0   # cible de diffusion des réseaux (true peak ≤ -1 dBTP) ; la loudness du pro est informative
+
+
 def ffmpeg():
     return _find("ffmpeg")
 
@@ -96,6 +133,20 @@ def probe(path):
         if rot in (90, 270):
             info["width"], info["height"] = info["height"], info["width"]
     return info
+
+
+# noms de dossiers que les créateurs utilisent déjà (le premier qui existe), sinon le dernier (celui du monteur)
+RUSHS = ("A-Roll", "a-roll", "rushs")
+BROLL = ("B-Roll", "b-roll", "secondaires", "broll")
+MUSIQUE = ("Musique", "music", "musique")
+
+
+def dossier(root, noms, force=None):
+    """Son dossier réel (noms exacts : A-Roll, B-Roll, secondaires…), sinon le dernier nom de la liste."""
+    if force:
+        return Path(root) / force
+    la = {p.name for p in Path(root).iterdir() if p.is_dir()} if Path(root).is_dir() else set()
+    return Path(root) / next((n for n in noms if n in la), noms[-1])
 
 
 def work_dir(root="."):

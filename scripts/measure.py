@@ -2,23 +2,28 @@
 
 Même code des deux côtés, sinon la comparaison n'a pas de sens.
 """
+import math
 import re
 import statistics
 import subprocess
+import tempfile
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from common import die, ffmpeg, probe, run, tonemap
+from common import FF_THREADS, die, ffmpeg, probe, run, tonemap
 
 try:  # lot B (parole) : même mesure de respiration que le rendu
-    from pacing import measure_breathing
+    from pacing import is_filler, measure_breathing
 except ImportError:
     measure_breathing = None
+
+    def is_filler(w):
+        return bool(w.get("filler"))
 try:  # lot A (son) : détection des bruitages
-    from audio import detect_sfx
+    from audio import carton_appris, detect_sfx
 except ImportError:
     detect_sfx = None
 try:  # lot C (image) : mêmes visages (YuNet, cache .monteur/visages) et même couleur que le rendu
@@ -65,13 +70,32 @@ def decode(path, width, fps=None, gray=True, info=None):
     h = max(2, round(width * info["height"] / info["width"] / 2) * 2)
     vf = (f"fps={fps}," if fps else "") + f"scale={width}:{h}:flags=area,{tonemap(info)}null"
     ch = 1 if gray else 3
-    r = subprocess.run([ffmpeg(), "-v", "error", "-i", str(path), "-an", "-vf", vf, "-f", "rawvideo",
-                        "-pix_fmt", "gray" if gray else "rgb24", "-"], capture_output=True)
-    if r.returncode != 0:
-        die(f"lecture vidéo impossible ({path}) : {r.stderr.decode(errors='replace')[-500:]}")
-    n = len(r.stdout) // (width * h * ch)
+    taille = width * h * ch
+    # lu directement dans un tampon à la bonne taille : la vidéo décodée n'existe qu'une fois en mémoire
+    # durée inconnue (rare) : 2 h au plus, le tampon ne grossit qu'au fil de la lecture
+    n_max = math.ceil((info["duration"] or 7200) * (fps or info.get("fps") or 30)) + 8
+    buf = bytearray(n_max * taille) if info["duration"] else bytearray()
+    with tempfile.TemporaryFile() as err:
+        p = subprocess.Popen([ffmpeg(), "-v", "error", *FF_THREADS, "-i", str(path), "-an", "-vf", vf, "-frames:v", str(n_max),
+                              "-f", "rawvideo", "-pix_fmt", "gray" if gray else "rgb24", "-"], stdout=subprocess.PIPE, stderr=err)
+        if buf:
+            vue, lu = memoryview(buf), 0
+            while lu < len(buf):
+                k = p.stdout.readinto(vue[lu:])
+                if not k:
+                    break
+                lu += k
+            del vue
+        else:
+            buf = bytearray(p.stdout.read())
+            lu = len(buf)
+        p.stdout.close()
+        if p.wait() != 0:
+            err.seek(0)
+            die(f"lecture vidéo impossible ({path}) : {err.read().decode(errors='replace')[-500:]}")
+    n = lu // taille
     shape = (n, h, width) if gray else (n, h, width, 3)
-    return np.frombuffer(r.stdout[: n * width * h * ch], np.uint8).reshape(shape)
+    return np.frombuffer(buf, np.uint8, n * taille).reshape(shape)
 
 
 def frame_diffs(frames):
@@ -200,6 +224,14 @@ def zooms(frames, cuts, fps):
             found.append({"t": round(debut / fps, 3), "type": zoom_kind(rampe_s, (b - a) / fps),
                           "echelle": round(s, 3), "rampe_s": round(rampe_s, 3), "centre": list(c)})
     return sorted(found, key=lambda z: z["t"])
+
+
+def zoom_fin(frames, cuts):
+    """Le dernier plan est plus large que l'avant-dernier (dézoom sec à la dernière coupe) ?"""
+    if not cuts:
+        return False
+    s, g, _ = zoom_between(frames[cuts[-1] - 1], frames[cuts[-1]])
+    return _is_zoom(s, g, ZOOM_GAIN_COUPE) and s < 1
 
 
 def audio(path, duration, peak=None):
@@ -428,6 +460,10 @@ def color_stats(path, rgb=None):
             return measure_colour(path)
         except Exception as e:
             print(f"couleur via reframe impossible ({e}) : calcul local")
+    return _rgb_stats(rgb)
+
+
+def _rgb_stats(rgb):
     if rgb is None or not len(rgb):
         return None
     h = rgb.shape[1]
@@ -603,6 +639,18 @@ def hook(words):
     return {"duree_s": round(first[-1]["end"], 2), "texte": texte, "type": kind}
 
 
+def debit(words):
+    """Débit de parole (mots/s) : mots hors hésitations / (fin du dernier − début du premier). None sous 3 mots."""
+    ws = sorted((w for w in words or [] if not is_filler(w)), key=lambda w: w["start"])
+    span = ws[-1]["end"] - ws[0]["start"] if len(ws) >= 3 else 0
+    return round(len(ws) / span, 3) if span > 0 else None
+
+
+def voix_sous_carton(words, fin):
+    """On entend parler (≥ 2 mots hors hésitations dits en entier) pendant le 1er plan (carton ou plan d'accroche)."""
+    return sum(1 for w in words or [] if not is_filler(w) and w["end"] <= fin) >= 2  # mots finis sous le carton
+
+
 def _pcm(path, rate=8000):
     r = subprocess.run([ffmpeg(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"],
                        capture_output=True)
@@ -637,6 +685,14 @@ def sfx(path, words):
         return None
     return [{"t": round(float(x.get("at", x.get("t", 0))), 3), "type": x.get("type_guess", x.get("type", "inconnu"))}
             for x in found or [] if isinstance(x, dict)]
+
+
+def carton_fin(words, plans):
+    """Fin du carton d'ouverture muet (1er plan ≥ 1 s sans parole : aucun mot hors hésitation avant sa fin − 0,2 s),
+    sinon 0. Le pro y pose ses bruitages ; on les entend nettement, hors voix."""
+    if len(plans) < 2 or plans[0][1] < 1.0:
+        return 0.0
+    return plans[0][1] if not any(not is_filler(w) and w["start"] < plans[0][1] - 0.2 for w in words or []) else 0.0
 
 
 def _near(visages, t, fps_c):
@@ -706,6 +762,7 @@ def measure(path, words=None):
     plans = [[round(a, 3), round(b, 3)] for a, b in zip(times, times[1:])]
     lens = [b - a for a, b in plans]
     z = zooms(frames, cuts, fps)
+    zf = zoom_fin(frames, cuts)
     del frames
     tp = []
     lufs, sil = audio(path, dur, tp) if info["has_audio"] else (None, [])
@@ -717,7 +774,10 @@ def measure(path, words=None):
     rgb = decode(path, COULEUR_LARGEUR, fps=fps_c, gray=False, info=info)
     visages = faces(rgb, path, fps_c)
     br = broll_plans(plans, visages, fps_c)
-    couleur = color_stats(path, rgb)
+    # la DA couleur = le look des plans face caméra : cartons et inserts graphiques (fond bleu nuit…) faussaient
+    # la cible (température 0,12 au lieu de 0,20 sur la peau) et le rendu refroidissait le rush
+    face = [j for j, f in enumerate(visages or []) if f]
+    couleur = _rgb_stats(rgb[face]) if len(face) >= 3 else color_stats(path, rgb)
     noir = images_noires(rgb)
     cad = cadrage(plans, visages, fps_c, br)
     caps = caption_colors(rgb, st_y, st_h) if st_score >= 0.3 else None
@@ -743,6 +803,7 @@ def measure(path, words=None):
         "zoom_rampe_s": round(statistics.median(rampes), 3) if rampes else None,
         "zoom_sur_visage": zooms_sur_visage(z, visages, fps_c),
         "zoom_une_coupe_sur": round(len(plans) / len(z), 1) if z else None,
+        "zoom_fin": zf,
         "lufs": lufs,
         "true_peak_db": tp[0] if tp else None,
         "silences": sil,
@@ -763,6 +824,7 @@ def measure(path, words=None):
         "broll_part": round(sum(b - a for a, b in br) / max(dur, 1e-6), 3) if br is not None else None,
         "broll_duree_moy_s": round(statistics.mean(b - a for a, b in br), 3) if br else None,
         "respiration": None, "hook": None, "musique_lufs": None, "sfx": None, "sfx_par_minute": None,
+        "sfx_carton": None,
     }
     if words:
         # plus long silence = plus grand trou entre deux mots : le niveau seul (-35 dB) ne voit aucun silence
@@ -774,10 +836,19 @@ def measure(path, words=None):
         m["silence_max_s"] = round(max((t["end"] - t["start"] for t in trous), default=0.0), 3)
         m["respiration"] = respiration(words, [i / fps for i in cuts])
         m["hook"] = hook(words)
+        m["voix_sous_carton"] = voix_sous_carton(words, plans[0][1])
+        # carton muet : la parole commence après lui, le débit se mesure hors carton
+        m["debit_mots_s"] = debit(words if m["voix_sous_carton"] else [w for w in words if w["start"] >= plans[0][1] - 0.05])
         if info["has_audio"]:
             m["musique_lufs"] = musique_sous_voix(path, words)
-            # sans mots, detect_sfx prendrait chaque début de phrase pour un bruitage
-            m["sfx"] = sfx(path, words)
+            # sans mots, detect_sfx prendrait chaque début de phrase pour un bruitage. Tout ce qu'il trouve est hors
+            # parole (fiable) ; sous le carton, une « hésitation » transcrite est souvent le bruitage lui-même
+            fin = carton_fin(words, plans)
+            m["sfx"] = sfx(path, [w for w in words if not (fin and is_filler(w) and w["end"] <= fin)])
             if m["sfx"] is not None:
-                m["sfx_par_minute"] = round(len(m["sfx"]) / minutes, 2)
+                hors = [x for x in m["sfx"] if x["t"] >= fin]
+                # bruitages/min hors carton : le carton en concentre une dizaine en 3 s, ce n'est pas le rythme du corps
+                m["sfx_par_minute"] = round(len(hors) / max(dur - fin, 1e-6) * 60, 2)
+                if fin and carton_appris is not None:
+                    m["sfx_carton"] = carton_appris(path, [x for x in m["sfx"] if x["t"] < fin], fin)
     return m

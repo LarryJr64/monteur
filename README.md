@@ -51,6 +51,16 @@ même *type* de son (whoosh, pop…) et d'emoji, pas forcément le fichier exact
    modèle de reconnaissance vocale (~700 Mo) et le modèle de détection de visage. Compte 5 à 15 minutes la
    première fois. Ensuite, plus rien à installer.
 
+## Démarrer
+Pas encore de vidéos à toi ? Dès le premier montage le résultat est propre :
+- **donne 1 à 3 reels que tu aimes** (dans `inspi/`) : il copie leur style ;
+- ou **choisis un style de départ** : interview posée (calme, sous-titres sobres), vlog dynamique (coupes très
+  rapides, gros sous-titres mot à mot, whooshs, musique), podcast extrait (plans longs, visage serré, karaoké),
+  pub produit (accroche en 2 s, produit à l'écran, appel à l'action), tuto face cam (étapes et chiffres à l'écran).
+  Dis « monte en style vlog dynamique », ou `python scripts/style_depart.py` pour la liste.
+
+Un style de départ n'est qu'une base de métier : tes corrections et les reels que tu donnes le remplacent.
+
 ## Utilisation en 3 étapes
 Crée un dossier pour tes vidéos (ex. `Documents/Montage`) et ouvre-le dans Claude Code (application : choisis
 ce dossier ; terminal : `cd` dedans puis `claude`). Les sous-dossiers `mes-videos`, `rushs`, `broll`, `musique`,
@@ -95,6 +105,22 @@ arrive dans `sorties/`.
 
 Avec « à chaque fois » / « toujours », ça devient une règle de ta DA (dans `ma-da/STYLE.md`).
 
+## Il apprend de toi
+- **Tes retouches** : tu as fini la vidéo dans CapCut, Premiere, DaVinci ou Final Cut ? Redonne-lui ta version
+  finale (la vidéo, ou l'export `.xml` / `.fcpxml`) : il la compare à la sienne (plans raccourcis, b-roll retirés,
+  zooms enlevés, sous-titres, couleur, musique…) et te propose en une question ce qu'il retient pour la suite.
+- **Tes corrections qui reviennent** : tu as demandé deux fois la même chose sur deux vidéos ? Il te propose d'en
+  faire une règle (journal `ma-da/corrections.jsonl`).
+- **Tes reels validés** : « parfait, je publie » → il propose de l'ajouter à tes références ; tes vidéos récentes
+  comptent plus que les anciennes et que les inspirations. Rien ne change sans ton accord, et ce que tu as fixé
+  (« toujours… ») ne bouge jamais.
+
+## Ce que je sais de ton style
+Dis « montre-moi ce que tu sais de mon style » (ou `python scripts/mon_style.py`) : une page s'ouvre dans ton
+navigateur, sans rien envoyer en ligne. Ton style en phrases simples (rythme, sous-titres avec un aperçu, zooms,
+plans de coupe, habillage, son, couleur), les règles apprises de tes corrections, les réglages que tu as fixés,
+d'où vient le style, et la progression de tes montages (de moins en moins d'écarts avec ton style).
+
 ## Pour de bons résultats
 - **Filme en vertical (9:16)**, visage vers le haut de l'image, bon son (micro-cravate si possible).
 - **Garde tes ratés** dans le même fichier : refais simplement la phrase, il choisit la meilleure prise.
@@ -105,16 +131,26 @@ Avec « à chaque fois » / « toujours », ça devient une règle de ta DA (dan
 
 ## Vie privée et coût
 Tout se passe **sur ton ordinateur** : transcription, analyse, montage. Ta voix et tes vidéos ne partent
-nulle part (seul Claude lit le texte de tes rushs et quelques images, comme dans toute conversation). Aucune
-clé, aucun service en plus : rien de plus que ton abonnement Claude. Tous les outils utilisés sont libres et
+nulle part (seul Claude lit le texte de tes rushs et quelques images, comme dans toute conversation). Aucun
+service payant en plus : rien de plus que ton abonnement Claude. Tous les outils utilisés sont libres et
 gratuits.
+
+## Illustrations libres
+Pas assez de plans à toi pour illustrer ce que tu dis ? Il cherche de courtes vidéos libres de droits (Wikimedia
+Commons, NASA, Openverse ; sans compte ni clé), t'en montre 4 à 6 par idée et ne télécharge que celles qu'il
+retient, dans `broll/libres/` (ou ton dossier de b-roll). Tes vidéos passent toujours d'abord. Seulement des
+licences sans condition gênante (domaine public, CC0, CC BY) ; les crédits sont notés dans `libres/CREDITS.md`
+et dans `.monteur/credits.txt`, à coller sous ton post. **Facultatif** : une clé gratuite Pexels
+(pexels.com/api) ou Pixabay donne beaucoup plus de vidéos verticales — colle-la à Claude, il l'enregistre. Tu
+préfères tes images seulement ? Dis « que mes images ».
 
 ## Limites
 - Fait pour les vidéos courtes (moins de ~3 min), face caméra ou voix off. Pas de vlog multi-caméra, pas d'effets 3D ni
   de motion design (sous-titres : pop, rebond, glissé, fondu, karaoké, mot par mot, surlignage), pas de
   transitions élaborées.
 - Les bruitages (whoosh…) ne s'entendent pas de façon fiable sous la voix : il te demande si tu en mets.
-- Il ne trouve pas de b-roll ni de musique sur Internet : il utilise ce que tu mets dans `broll/` et `musique/`.
+- Les illustrations libres sans clé sont surtout en paysage (recadrées en vertical) ; le choix vertical est
+  bien plus large avec une clé Pexels gratuite.
 - Sans carte graphique, compte environ 1 minute de calcul par minute de vidéo pour la transcription (au
   premier apprentissage de ta DA aussi). « Fais vite » : modèle plus rapide (~3x), un peu plus de fautes.
 - Certaines mesures sont des estimations : b-roll = plans où on ne voit pas ton visage ; un emoji qui

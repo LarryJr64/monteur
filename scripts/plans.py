@@ -41,6 +41,19 @@ def _sharpness(gray):
     return float(np.abs(np.diff(g, axis=0)).mean() + np.abs(np.diff(g, axis=1)).mean())
 
 
+def fusion_courts(times, mini=None):
+    """Bornes de plans où un morceau < `mini` (stroboscope, flash de boîte de nuit pris pour des coupes) est fusionné
+    avec le suivant au lieu d'être perdu ; un dernier morceau trop court (souvent l'amorce du plan d'après) saute."""
+    mini = PLAN_MIN_S if mini is None else mini
+    out = [times[0]]
+    for t in times[1:-1]:
+        if t - out[-1] >= mini:
+            out.append(t)
+    if times[-1] - out[-1] >= mini or len(out) == 1:
+        out.append(times[-1])
+    return out
+
+
 def shots(path):
     """[(start, end, netteté, mouvement, vignette PIL)] d'une vidéo."""
     info = probe(path)
@@ -51,7 +64,7 @@ def shots(path):
     gray = measure.decode(path, measure.ANALYSE_LARGEUR, fps=fps, info=info)
     d = measure.frame_diffs(gray)
     cuts = measure.detect_cuts(d, fps)
-    times = [0.0] + [i / fps for i in cuts] + [dur]
+    times = fusion_courts([0.0] + [i / fps for i in cuts] + [dur])
     rgb = measure.decode(path, CASE, fps=2, gray=False, info=info)
     out = []
     lum = gray.reshape(len(gray), -1).mean(axis=1) if len(gray) else []
@@ -101,7 +114,7 @@ def index(folders, root):
                 desc[(parts[1], start)] = parts[4].strip()
     files = []
     for f in folders:
-        p = Path(f)
+        p = Path(f) if Path(f).exists() else Path(root) / f  # relatif au dossier courant, sinon au dossier de travail
         if p.is_file():
             files.append(p)
         elif p.is_dir():
@@ -148,9 +161,16 @@ def descriptions(wd, plans=None):
     if f.exists():
         for line in f.read_text(encoding="utf-8").splitlines():
             pid, _, txt = line.partition(":")
-            pid = pid.strip().upper()
-            if pid in plans and txt.strip():
-                plans[pid]["description"] = txt.strip()
+            pid, txt = pid.strip(), txt.strip()
+            if not txt:
+                continue
+            if pid.upper() in plans:
+                plans[pid.upper()]["description"] = txt
+                continue
+            # « B-Roll/libres/dubai-2.mp4: … » (écrit par illustrer.py avant l'indexation) : ses plans encore vides
+            for v in plans.values():
+                if v["source"] == pid and not v["description"]:
+                    v["description"] = txt
     (wd / "plans.json").write_text(json.dumps({"plans": plans}, ensure_ascii=False, indent=1), encoding="utf-8")
     tab = "\t"
     lines = [tab.join([pid, v["source"], f"{_fr(v['start'], 2)}–{_fr(v['end'], 2)} ({_fr(v['duree'])} s)",
@@ -264,8 +284,9 @@ def main(argv=None):
     ap.add_argument("dossiers", nargs="*", help="dossiers ou fichiers vidéo à indexer (ex. rushs broll)")
     ap.add_argument("--voix", help="fichier de la voix off (déjà transcrit) : écrit .monteur/cadence.md")
     ap.add_argument("--profil", help="ma-da/profile.json (défaut)")
+    ap.add_argument("--root", default=".", help="dossier de travail (contient .monteur/)")
     a = ap.parse_args(argv)
-    root = Path.cwd()
+    root = Path(a.root)
     prof = Path(a.profil) if a.profil else root / "ma-da" / "profile.json"
     profile = json.loads(prof.read_text(encoding="utf-8")) if prof.is_file() else {}
     if not a.dossiers and not a.voix:

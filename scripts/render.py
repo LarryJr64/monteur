@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import die, ffmpeg, probe, run, tonemap  # noqa: E402
+from common import FF_THREADS, MUSIQUE_DB_DEFAUT, PARALLELE, die, ffmpeg, probe, run, tonemap  # noqa: E402
 import captions  # noqa: E402
 import reframe as rf  # noqa: E402
 
@@ -39,9 +39,27 @@ except ImportError:
     audio = None
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+VIGNETTE, VIGNETTE_Y = 0.74, 0.60  # b-roll « vignette » : taille (part de la largeur), centre vertical
+RAYON, OMBRE, GLISSE = 0.055, 0.04, 8  # coins arrondis, ombre portée (parts du côté), entrée glissée (images)
+FONT = Path(__file__).parent / "fonts" / "Poppins-ExtraBold.ttf"
 FADE = 0.03
 EMOJI_DIR = Path(__file__).resolve().parent.parent / "assets" / "emoji"
 EMOJI_URL = "https://raw.githubusercontent.com/googlefonts/noto-emoji/main/2D/png/128/"
+
+
+TRANSITIONS = {"flash": ("#FFFFFF", 0.24), "noir": ("#000000", 0.3),  # type → (couleur par défaut, durée s)
+               "fuite": ("#F2B36B", 0.3)}  # fuite de lumière chaude qui monte du bas
+
+
+def transition_alpha(kind, d):
+    """Filtre d'opacité du calque de transition : aplat qui monte et redescend (flash, noir) ; fuite = dégradé
+    vertical qui monte du bas jusqu'à ~45 % de l'image puis retombe."""
+    if kind == "fuite":
+        s = f"sin(PI*min(T/{d:.3f},1))"
+        return (f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':"
+                f"a='217*{s}*clip((Y-H*(1-0.45*{s}))/(0.35*H),0,1)'")
+    return (f"colorchannelmixer=aa=0.9,fade=t=in:st=0:d={d / 2:.3f}:alpha=1,"
+            f"fade=t=out:st={d / 2:.3f}:d={d / 2:.3f}:alpha=1")
 
 
 def reframe(W, H, w, h, zoom=1.0, center=(0.5, 0.5)):
@@ -53,7 +71,7 @@ def reframe(W, H, w, h, zoom=1.0, center=(0.5, 0.5)):
 def venc(draft, final=False):
     # intermédiaires quasi sans perte et rapides ; la qualité de livraison se joue à la finition
     preset, crf = ("ultrafast", "28") if draft else (("veryfast", "19") if final else ("ultrafast", "14"))
-    return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-profile:v", "high", "-pix_fmt", "yuv420p",
+    return [*FF_THREADS, "-c:v", "libx264", "-preset", preset, "-crf", crf, "-profile:v", "high", "-pix_fmt", "yuv420p",
             # mêmes étiquettes sur tous les intermédiaires : sinon le concat reconfigure ses filtres et perd des images
             "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
 
@@ -98,15 +116,78 @@ def plan(seg, info, w, h, fps, track, kind, prev, rampe_s, use_face, cadrage=Non
     return crops, faces, last
 
 
+def transitions_of(edl_r, brolls, fps):
+    """Transitions à poser : edl `transitions` + b-roll `entree` (à son début) / `sortie` (à sa fin)."""
+    trs = list(edl_r.get("transitions") or [])
+    for b in brolls:
+        for cle, at in (("entree", b["at"]), ("sortie", b["at"] + b["frames"] / fps)):
+            if b.get(cle) in TRANSITIONS:
+                coul = b.get(f"{cle}_couleur")
+                trs.append({"at": round(at, 6), "type": b[cle], **({"couleur": coul} if coul else {})})
+    return trs
+
+
 def _even(n):
     return max(2, int(n) // 2 * 2)
+
+
+def calques(cote, tmp, k, etiquette=None, w=1080):
+    """PNG des habillages d'une vignette : masque à coins arrondis, ombre portée ; étiquette de lieu (pilule)."""
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
+    r, m = round(RAYON * cote), round(OMBRE * cote)
+    masque = Image.new("L", (cote, cote), 0)
+    ImageDraw.Draw(masque).rounded_rectangle((0, 0, cote - 1, cote - 1), radius=r, fill=255)
+    ombre = Image.new("RGBA", (cote + 2 * m, cote + 2 * m), (0, 0, 0, 0))
+    ImageDraw.Draw(ombre).rounded_rectangle((m, m + m // 3, m + cote, m + cote + m // 3), radius=r, fill=(0, 0, 0, 150))
+    ombre = ombre.filter(ImageFilter.GaussianBlur(m / 2))
+    out = {"masque": tmp / f"masque{k}.png", "ombre": tmp / f"ombre{k}.png"}
+    masque.save(out["masque"])
+    ombre.save(out["ombre"])
+    if etiquette:
+        f = ImageFont.truetype(str(FONT), round(w * 0.036))
+        tw = round(ImageDraw.Draw(Image.new("L", (1, 1))).textlength(etiquette, font=f))
+        hh = round(f.size * 1.9)
+        im = Image.new("RGBA", (tw + hh + hh // 2, hh), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        d.rounded_rectangle((0, 0, im.width - 1, hh - 1), radius=hh // 2, fill=(255, 255, 255, 235))
+        cx, cy, pr = hh * 0.55, hh * 0.44, hh * 0.2  # épingle
+        d.ellipse((cx - pr, cy - pr, cx + pr, cy + pr), fill=(232, 72, 60, 255))
+        d.polygon([(cx - pr * 0.8, cy + pr * 0.5), (cx + pr * 0.8, cy + pr * 0.5), (cx, cy + pr * 2.1)], fill=(232, 72, 60, 255))
+        d.ellipse((cx - pr * 0.4, cy - pr * 0.4, cx + pr * 0.4, cy + pr * 0.4), fill=(255, 255, 255, 255))
+        d.text((hh * 0.95, hh / 2), etiquette, font=f, fill=(20, 20, 20, 255), anchor="lm")
+        out["etiquette"] = tmp / f"etiquette{k}.png"
+        im.save(out["etiquette"])
+    return out
+
+
+def masque_filtre(m, W, H):
+    """b-roll `masque` [x, y, w, h] (fractions de l'image source) → « delogo=…, » en px, gardé à 1 px des bords
+    (delogo refuse une zone qui touche le cadre) ; "" sans masque."""
+    if not m:
+        return ""
+    x, y = max(1, round(m[0] * W)), max(1, round(m[1] * H))
+    mw, mh = min(W - 1 - x, round(m[2] * W)), min(H - 1 - y, round(m[3] * H))
+    return f"delogo=x={x}:y={y}:w={mw}:h={mh}," if mw > 0 and mh > 0 else ""
+
+
+def fond_flou_filtre(crop, w, h, pad):
+    """Plan entier (zone `crop` de la source) ajusté dans w×h, agrandi au plus d'AGRANDI_MAX, sur le même plan
+    flouté et assombri en fond (paysage trop peu défini pour remplir le 9:16 sans flou)."""
+    x, y, cw, ch = crop
+    s = min(w / cw, h / ch, rf.AGRANDI_MAX)
+    fw, fh = _even(cw * s), _even(ch * s)
+    bw, bh = _even(w / 8), _even(h / 8)  # flou calculé petit puis agrandi : même rendu, bien plus rapide
+    return (f"crop={cw:.0f}:{ch:.0f}:{x:.0f}:{y:.0f},split[ff][fb];"
+            f"[fb]scale={bw}:{bh}:force_original_aspect_ratio=increase,crop={bw}:{bh},gblur=sigma=4,"
+            f"colorchannelmixer=rr=0.6:gg=0.6:bb=0.6,scale={w}:{h}[fbg];[ff]scale={fw}:{fh}:flags=lanczos[ffg];"
+            f"[fbg][ffg]overlay=(W-w)/2:(H-h)/2,{pad}")
 
 
 def _input_args(src, seg, fps, image):
     dur = seg["frames"] / fps
     if image:
         return ["-loop", "1", "-framerate", str(fps), "-t", f"{dur + 0.5:.6f}", "-i", str(src)]
-    return ["-ss", f"{seg['start']:.6f}", "-t", f"{dur + 0.5:.6f}", "-i", str(src)]
+    return [*FF_THREADS, "-ss", f"{seg['start']:.6f}", "-t", f"{dur + 0.5:.6f}", "-i", str(src)]
 
 
 def render_segment(seg, src, out, w, h, fps, crops, colour, draft, with_audio=True, image=False):
@@ -123,7 +204,9 @@ def render_segment(seg, src, out, w, h, fps, crops, colour, draft, with_audio=Tr
              f"[1:v]setsar=1,format=yuv420p[v];[0:a]{af}[a]", "-map", "[v]", "-frames:v", str(seg["frames"]),
              "-r", str(fps), *venc(draft), "-map", "[a]", "-c:a", "pcm_s16le", str(out)])
         return
-    post = "setsar=1" + (f",{colour}" if colour else "") + ",format=yuv420p"
+    # source très agrandie (rush horizontal recadré en vertical : ×1,8) : un peu de netteté sur la luminance
+    net = ",unsharp=5:5:0.6:5:5:0" if not image and crops and w / max(1, crops[0][2]) > 1.4 else ""
+    post = "setsar=1" + net + (f",{colour}" if colour else "") + ",format=yuv420p"
     af = (f"aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{dur:.6f},"
           f"afade=t=in:d={FADE},afade=t=out:st={max(0, dur - FADE):.6f}:d={FADE}")
     x0 = crops[0]
@@ -134,7 +217,8 @@ def render_segment(seg, src, out, w, h, fps, crops, colour, draft, with_audio=Tr
     except ImportError:
         moving = False  # shortcut: sans OpenCV, cadre fixe (celui du milieu du segment)
         x0 = crops[len(crops) // 2]
-    src_audio = with_audio and info["has_audio"] and not image
+    # segment « muet » (question sous un carton muet) : silence à la place du son, la piste reste continue
+    src_audio = with_audio and info["has_audio"] and not image and not seg.get("muet")
     silence = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"] if with_audio and not src_audio else []
     a_map = ["-map", "[a]", "-c:a", "pcm_s16le"] if with_audio else ["-an"]
     tail = ["-frames:v", str(seg["frames"]), "-r", str(fps), *venc(draft), *a_map, str(out)]
@@ -142,7 +226,10 @@ def render_segment(seg, src, out, w, h, fps, crops, colour, draft, with_audio=Tr
         x, y, cw, ch = x0
         # tpad : un plan plus court que sa place à l'écran garde sa dernière image (jamais de trou noir)
         pad = f"tpad=stop_mode=clone:stop_duration={dur + 1:.3f}," if not with_audio else ""  # b-roll seulement
-        vf = f"fps={fps},{tonemap(info)}crop={cw:.0f}:{ch:.0f}:{x:.0f}:{y:.0f},scale={w}:{h}:flags=lanczos,{pad}{post}"
+        msk = masque_filtre(seg.get("masque"), info["width"], info["height"])  # filigrane effacé avant recadrage
+        vf = (f"fps={fps},{tonemap(info)}{msk}" + (fond_flou_filtre(x0, w, h, pad) if seg.get("fond_flou") else
+                                                   f"crop={cw:.0f}:{ch:.0f}:{x:.0f}:{y:.0f},scale={w}:{h}:flags=lanczos,{pad}")
+              + post)
         graph = f"[0:v]{vf}[v]" + (f";[{0 if src_audio else 1}:a]{af}[a]" if with_audio else "")
         run([ffmpeg(), "-y", "-v", "error", *_input_args(src, seg, fps, image), *silence,
              "-filter_complex", graph, "-map", "[v]", *tail])
@@ -159,7 +246,8 @@ def _render_warp(src, info, seg, crops, w, h, fps, post, af, a_args, tail, draft
     W, H = _even(info["width"]), _even(info["height"])
     kx, ky = W / info["width"], H / info["height"]
     dec = subprocess.Popen([ffmpeg(), "-v", "error", *_input_args(src, seg, fps, image),
-                            "-vf", f"fps={fps},scale={W}:{H},{tonemap(info)}null", "-pix_fmt", "yuv420p",
+                            "-vf", f"fps={fps},{masque_filtre(seg.get('masque'), info['width'], info['height'])}"
+                            f"scale={W}:{H},{tonemap(info)}null", "-pix_fmt", "yuv420p",
                             "-f", "rawvideo", "-"],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     err = tempfile.TemporaryFile()
@@ -224,7 +312,9 @@ def build_audio(tmp, edl_r, profile, root, total, draft=False):
         clean = tmp / "voix_propre.wav"
         res = audio.prepare_voice(voice, clean, mode, profile) or {}
         audio.finish_mix(clean if clean.exists() else voice, edl_r, profile, root, mix)
-        return mix, f"voix {res.get('methode', mode) if res.get('applique') else 'non nettoyée'}, mix audio.py"
+        etat = (f"voix nettoyée ({res.get('methode')})" if res.get("applique") else
+                "voix déjà propre, pas de débruitage" if mode == "auto" else "voix non nettoyée (demandé)")
+        return mix, f"{etat}, mix audio.py"
     target = (profile.get("audio") or {}).get("lufs_cible", -14)
     pre = voice
     music = edl_r.get("music")
@@ -232,11 +322,11 @@ def build_audio(tmp, edl_r, profile, root, total, draft=False):
         msrc = (root / music["source"]).resolve()
         if not msrc.exists():
             die(f"musique introuvable : {msrc}")
-        vol = music.get("volume_db", (profile.get("audio") or {}).get("musique_db_sous_voix", -18))
+        vol = music.get("volume_db", (profile.get("audio") or {}).get("musique_db_sous_voix") or MUSIQUE_DB_DEFAUT)
         pre = tmp / "pre.wav"
         run([ffmpeg(), "-y", "-v", "error", "-i", str(voice), "-stream_loop", "-1", "-i", str(msrc), "-filter_complex",
              f"[1:a]aresample=48000,aformat=channel_layouts=stereo,volume={vol}dB,atrim=0:{total:.6f},"
-             f"afade=t=out:st={max(0, total - 1):.6f}:d=1[mus];[0:a]asplit[voix][sc];"
+             f"afade=t=out:st={max(0, total - 0.4):.6f}:d=0.4[mus];[0:a]asplit[voix][sc];"
              "[mus][sc]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=400[duck];"
              "[voix][duck]amix=inputs=2:normalize=0:duration=first[a]", "-map", "[a]", "-c:a", "pcm_s16le", str(pre)])
     m = loudness(pre, target)
@@ -252,6 +342,23 @@ def build_audio(tmp, edl_r, profile, root, total, draft=False):
 
 
 # ---------- emojis ----------
+
+def sans_sous_titres(brolls, st, fps):
+    """Intervalles sans sous-titres : `sous_titres` du b-roll (anim.py l'écrit d'après graphismes[] du profil) ;
+    sinon un insert (« texte » : true) dit déjà la phrase et un plan filmé suit `sous_titres.sur_broll` (défaut oui)."""
+    sur_broll = (st or {}).get("sur_broll", True) is not False
+    return [(b["at"], b["at"] + b["frames"] / fps) for b in brolls
+            if not b.get("sous_titres", sur_broll and not b.get("texte"))]
+
+
+def luma_zone(path, t, haut, bas):
+    """Luma moyenne 0-1 de la bande [haut, bas] (parts de la hauteur) de l'image à `t` s de `path` ; None sinon."""
+    r = subprocess.run([ffmpeg(), "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", str(path), "-frames:v", "1", "-vf",
+                        f"crop=iw:ih*{max(0.01, bas - haut):.4f}:0:ih*{max(0.0, haut):.4f},scale=64:8,format=gray",
+                        "-f", "rawvideo", "-"], capture_output=True)
+    px = r.stdout
+    return min(1.0, max(0.0, (sum(px) / len(px) - 16) / 219)) if px else None  # luma vidéo 16-235
+
 
 def emoji_png(e):
     """PNG Noto (assets/emoji, OFL) d'un emoji ; téléchargé dans ~/.cache/monteur/emoji s'il manque ; None sinon."""
@@ -331,19 +438,23 @@ def main():
         brolls.append(dict(b, start=b.get("source_start", 0), frames=max(1, round(b["duration"] * fps)), index=k,
                            image=src.suffix.lower() in IMAGE_EXT, path=src,
                            zoom_center=b.get("zoom_center", "visage" if v2 else [0.5, 0.5])))
+        if brolls[-1]["image"] and "zoom" not in b and not b.get("texte"):  # photo : lente poussée (Ken Burns)
+            brolls[-1].update(zoom=1.10, zoom_type="doux")
     stage("plan")
 
     # 0. analyse : visages (centrage + sous-titres hors visage) et couleur, en cache / en parallèle
     infos = {}
+    inserts = {b["path"] for b in brolls if b.get("texte")}
     for p in {root / s["source"] for s in segs} | {b["path"] for b in brolls}:
         infos[p] = probe(p)
-        if p.suffix.lower() not in IMAGE_EXT and infos[p].get("width"):
+        # inserts à texte (anim.py, cartes) : graphisme plein cadre voulu, ses bords sombres ne sont pas des bandes
+        if p.suffix.lower() not in IMAGE_EXT and infos[p].get("width") and p not in inserts:
             infos[p]["bandes"] = rf.active_area(p, infos[p])
             if any(infos[p]["bandes"]):
                 print(f"{p.name} : bandes noires retirées du cadre (g/h/d/b px) {infos[p]['bandes']}")
     cache_dir = root / ".monteur"
     jobs = [(root / s["source"], s) for s in segs if infos[root / s["source"]].get("width")] +         [(b["path"], b) for b in brolls if not b["image"]]
-    with ThreadPoolExecutor(4) as pool:
+    with ThreadPoolExecutor(PARALLELE) as pool:
         tracks = list(pool.map(lambda j: rf.face_track(j[0], j[1]["start"], j[1]["start"] + j[1]["frames"] / fps,
                                                        fps, cache_dir=cache_dir), jobs))
     track_of = {id(s): t for (_, s), t in zip(jobs, tracks)}
@@ -360,7 +471,31 @@ def main():
         faces += f
     bplans = []
     for b in brolls:
-        crops, _, _ = plan(b, infos[b["path"]], w, h, fps, track_of.get(id(b)), b.get("zoom_type"), 1.0, rampe_s,
+        # vignette : carré à 84 % de la largeur posé sur l'orateur (le visage reste visible au-dessus)
+        b["wh"] = (_even(VIGNETTE * w),) * 2 if b.get("vignette") else (w, h)
+        inf = infos[b["path"]]
+        if inf.get("width") and not b.get("texte"):
+            bl, bt, br_, bb = inf.get("bandes") or (0, 0, 0, 0)
+            aw, ah = inf["width"] - bl - br_, inf["height"] - bt - bb
+            wh = (b["wh"][0] * fmt["width"] / w, b["wh"][1] * fmt["height"] / h)  # jugé en définition finale
+            if not b["image"]:  # photo : la lente poussée (Ken Burns) reste un mouvement voulu
+                voulu = isinstance(edl["broll"][b["index"]].get("zoom_center"), (list, tuple))
+                z = rf.zoom_borne(aw, ah, *wh, b.get("zoom"), voulu)
+                if z < (b.get("zoom") or 1.0) - 1e-3:
+                    print(f"{b['path'].name} : zoom {b['zoom']} ramené à {z:.2f} (au-delà, plan agrandi : flou)")
+                    b["zoom"] = z
+                    if z <= 1.0:
+                        b["zoom_type"] = None
+            ag = rf.agrandissement(aw, ah, *wh, b.get("zoom"), b.get("fond_flou"))
+            if ag > rf.AGRANDI_MAX + 0.01:
+                print(f"{b['path'].name} à {b['at']:.1f} s : plan agrandi ×{ag:.2f} (flou) → \"fond_flou\": true "
+                      "(plan entier sur fond flou) ou un plan plus défini")
+            if b.get("fond_flou"):  # plan entier, cadre fixe : zone `zoom` autour de zoom_center, au ratio source
+                c = b["zoom_center"] if isinstance(b["zoom_center"], (list, tuple)) else (0.5, 0.5)
+                x, y, cw, ch = rf.crop_box(aw, ah, aw, ah, max(b.get("zoom") or 1.0, 1.0), c)
+                bplans.append([(x + bl, y + bt, cw, ch)] * b["frames"])
+                continue
+        crops, _, _ = plan(b, infos[b["path"]], *b["wh"], fps, track_of.get(id(b)), b.get("zoom_type"), 1.0, rampe_s,
                            b["zoom_center"] == "visage" and not b["image"])
         bplans.append(crops)
     colours = {}
@@ -371,32 +506,42 @@ def main():
         spans = {}
         for item, crops in [(s, c) for s, c in zip(segs, plans)] + [(b, c) for b, c in zip(brolls, bplans)]:
             p = item["path"] if "path" in item else root / item["source"]
-            if not infos[p].get("width"):
-                continue  # voix off : pas d'image
+            if not infos[p].get("width") or p in inserts:
+                continue  # voix off : pas d'image ; insert graphique : ses couleurs sont voulues (logo sur blanc)
             W, H = infos[p]["width"], infos[p]["height"]
             spans.setdefault(p, []).extend((x / W, y / H, (x + cw) / W, (y + ch) / H) for x, y, cw, ch in crops[::5])
         boxes = {p: tuple(statistics.median(c[k] for c in v) for k in range(4)) for p, v in spans.items()}
-        with ThreadPoolExecutor(4) as pool:
+        with ThreadPoolExecutor(PARALLELE) as pool:
             ms = dict(zip(boxes, pool.map(lambda p: rf.measure_colour(p, box=boxes[p]), boxes)))
         # mesure impossible (None) → colour_filter rend "" : ce média reste tel quel
-        colours = {p: rf.colour_filter(m, target) for p, m in ms.items()}
+        # plans filmés en b-roll : calés sur le rush face caméra tel qu'il sortira corrigé (luma, température), pas
+        # sur la moyenne de la DA (une boîte de nuit bleue au milieu de rushs chauds sautait aux yeux)
+        rushs = {root / s["source"] for s in segs} & {p for p, m in ms.items() if m}
+        apres = [rf.colour_plan(ms[p], target)[1] for p in rushs]
+        cal = rf.pooled_colour(apres, [1] * len(apres))
+        colours = {p: rf.colour_filter(m, target if p in rushs or not cal else
+                                       dict(target, luma=cal["luma"], temperature=cal["temperature"]))
+                   for p, m in ms.items()}
         if any(m is None for m in ms.values()):
             print("couleur auto : certains médias sans image mesurable, laissés tels quels.")
     elif edl.get("couleur") == "auto":
         print("couleur auto : profile.couleur absent, rien appliqué.")
-    for b in brolls:  # b-roll à l'écran : pas de visage de l'orateur à éviter
+    for b in brolls:  # b-roll plein écran : pas de visage à éviter ; vignette : les sous-titres l'évitent
         i0 = round(b["at"] * fps)
-        faces[i0:i0 + b["frames"]] = [None] * len(faces[i0:i0 + b["frames"]])
+        demi = b["wh"][0] / 2 / h
+        zone = (VIGNETTE_Y - demi, VIGNETTE_Y + demi) if b.get("vignette") else None
+        zone = tuple(b["evite"]) if b.get("evite") else zone  # insert : carte de la mosaïque (haut, bas en part de h)
+        faces[i0:i0 + b["frames"]] = [zone] * len(faces[i0:i0 + b["frames"]])
 
     tmp = Path(tempfile.mkdtemp(prefix="monteur_"))
     try:
         # 1. segments et b-roll
         names = [f"seg{s['index']:04d}.mkv" for s in segs]
         bnames = [f"broll{b['index']:03d}.mkv" for b in brolls]
-        with ThreadPoolExecutor(3) as pool:  # x264 est déjà multithread ; 3 suffit à occuper les cœurs
+        with ThreadPoolExecutor(PARALLELE) as pool:  # x264 est déjà multithread
             futs = [pool.submit(render_segment, s, root / s["source"], tmp / n, w, h, fps, c,
                                 colours.get(root / s["source"], ""), a.brouillon) for s, n, c in zip(segs, names, plans)]
-            futs += [pool.submit(render_segment, b, b["path"], tmp / n, w, h, fps, c, colours.get(b["path"], ""),
+            futs += [pool.submit(render_segment, b, b["path"], tmp / n, *b["wh"], fps, c, colours.get(b["path"], ""),
                                  a.brouillon, False, b["image"]) for b, n, c in zip(brolls, bnames, bplans)]
             for f in futs:
                 f.result()
@@ -433,15 +578,18 @@ def main():
                     vus.append(tmp / nm)
                     poids.append(d - cache)
                 off += d
-            vus += [tmp / bn for bn in bnames]
-            poids += [b["frames"] / fps for b in brolls]
-            with ThreadPoolExecutor(4) as pool:
+            vus += [tmp / bn for b, bn in zip(brolls, bnames) if not b.get("texte")]
+            poids += [b["frames"] / fps for b in brolls if not b.get("texte")]
+            with ThreadPoolExecutor(PARALLELE) as pool:
                 st_segs = list(pool.map(lambda f: rf.measure_colour(f, n=3), vus))
             vu = rf.pooled_colour(st_segs, poids)
             reste = rf.colour_filter(vu, target)
             print(f"  couleur à l'écran {vu} → cible {target} : correction finale « {reste or 'aucune'} »")
         else:
             reste = ""
+        if reste:
+            graph.append(f"{v}{reste}[basec]")
+            v = "[basec]"
         trans = (profile.get("broll") or {}).get("transition", "coupe")
         for k, (b, bn) in enumerate(zip(brolls, bnames)):
             args += ["-i", bn]
@@ -455,12 +603,40 @@ def main():
             # sont arrondis ; comparés en secondes, la 1re ou la dernière image d'un b-roll sautait (noir en voix off,
             # visage de l'orateur ailleurs)
             f0 = round(b["at"] * fps)
-            graph.append(f"[{n}:v]{fade}{tb},setpts=N+{f0}[b{k}]")
-            graph.append(f"{v}[b{k}]overlay=eof_action=pass:enable='between(n,{f0},{f0 + b['frames'] - 1})'[v{k}]")
-            v, n = f"[v{k}]", n + 1
-        if reste:  # après les b-roll : la correction finale vaut pour tout ce qui est à l'écran
-            graph.append(f"{v}{reste}[vc]")
-            v = "[vc]"
+            en = f"enable='between(n,{f0},{f0 + b['frames'] - 1})'"
+            # correction finale sur les images filmées seulement : un insert graphique garde ses couleurs
+            cc = f"{reste}," if reste and not b.get("texte") else ""
+            graph.append(f"[{n}:v]{cc}{fade}{tb},setpts=N+{f0}[b{k}]")
+            n += 1
+            lieu = b.get("etiquette")
+            if b.get("vignette"):  # coins arrondis + ombre, sous le visage ; entre en glissant vers le haut
+                cote = b["wh"][0]
+                cq = calques(cote, tmp, k, lieu, w)
+                boucle = ["-loop", "1", "-framerate", str(fps), "-t", f"{d + 0.5:.3f}", "-i"]
+                args += [*boucle, cq["masque"].name, *boucle, cq["ombre"].name]
+                x0, y0, m = (w - cote) // 2, round(VIGNETTE_Y * h - cote / 2), round(OMBRE * cote)
+                glisse = f"{y0}+{round(0.03 * h)}*pow(max(0,1-(n-{f0})/{GLISSE}),2)"
+                apparait = f"fade=t=in:st={f0 / fps:.4f}:d={GLISSE / fps:.4f}:alpha=1"
+                graph.append(f"[{n}:v]format=gray,{tb},setpts=N+{f0}[m{k}]")
+                graph.append(f"[b{k}]format=yuva420p[ba{k}];[ba{k}][m{k}]alphamerge,{apparait}[bm{k}]")
+                graph.append(f"[{n + 1}:v]format=rgba,{tb},setpts=N+{f0},{apparait}[o{k}]")
+                graph.append(f"{v}[o{k}]overlay=eof_action=pass:eval=frame:x={x0 - m}:y='{glisse}-{m}':{en}[vo{k}]")
+                graph.append(f"[vo{k}][bm{k}]overlay=eof_action=pass:eval=frame:x={x0}:y='{glisse}':{en}[v{k}]")
+                n += 2
+                lx, ly = x0 + round(0.04 * cote), y0 + cote - round(0.04 * cote)  # coin bas gauche, à cheval
+            else:
+                graph.append(f"{v}[b{k}]overlay=eof_action=pass:{en}[v{k}]")
+                cq = calques(64, tmp, k, lieu, w) if lieu else {}
+                lx, ly = round(0.06 * w), round(0.76 * h)
+            v = f"[v{k}]"
+            if lieu:  # étiquette de lieu, posée un temps après l'image
+                f1 = f0 + min(GLISSE + 4, b["frames"] // 3)
+                args += ["-loop", "1", "-framerate", str(fps), "-t", f"{d + 0.5:.3f}", "-i", cq["etiquette"].name]
+                graph.append(f"[{n}:v]format=rgba,{tb},setpts=N+{f0},"
+                             f"fade=t=in:st={f1 / fps:.4f}:d={6 / fps:.4f}:alpha=1[e{k}]")
+                graph.append(f"{v}[e{k}]overlay=eof_action=pass:x={lx}:y={ly}-overlay_h/2:"
+                             f"enable='between(n,{f1},{f0 + b['frames'] - 1})'[ve{k}]")
+                v, n = f"[ve{k}]", n + 1
 
         st = profile.get("sous_titres")
         fw, fh = fmt["width"], fmt["height"]
@@ -470,8 +646,25 @@ def main():
             return (min(f[0] for f in boxes) * fh, max(f[1] for f in boxes) * fh) if boxes else None
 
         words = captions.timeline_words(segs, root) if edl.get("captions", True) else []
+        cartes = sans_sous_titres(brolls, st, fps)
+        words = [w for w in words if not any(a <= captions.mi(w) < z for a, z in cartes)]
         if words or edl.get("titles"):
-            ass = captions.build_ass(words, st, fw, fh, edl.get("titles") or [], face_at=face_at)
+            def luma_at(t_a, t_b, haut, bas):
+                """Luma derrière un bloc : le plan à l'écran à son milieu (b-roll plein cadre, sinon segment), lu dans
+                les intermédiaires déjà rendus. shortcut: vignette et correction finale ignorées."""
+                t = (t_a + t_b) / 2
+                for b, bn in reversed(list(zip(brolls, bnames))):
+                    if not b.get("vignette") and b["at"] <= t < b["at"] + b["frames"] / fps:
+                        return luma_zone(tmp / bn, t - b["at"], haut, bas)
+                off = 0.0
+                for s, nm in zip(segs, names):
+                    if t < off + s["frames"] / fps:
+                        return luma_zone(tmp / nm, t - off, haut, bas)
+                    off += s["frames"] / fps
+                return None
+
+            ass = captions.build_ass(words, st, fw, fh, edl.get("titles") or [], face_at=face_at, caches=cartes,
+                                     luma_at=luma_at)
             (tmp / "captions.ass").write_text(ass, encoding="utf-8")
             shutil.copytree(captions.FONTS_DIR, tmp / "fonts", dirs_exist_ok=True)
             # chemins relatifs (cwd = tmp) : évite l'échappement des « C:\ » dans les filtres
@@ -492,8 +685,25 @@ def main():
                          f"eof_action=pass:enable='between(t,{e['start']:.3f},{e['end']:.3f})'[ve{j}]")
             v, n = f"[ve{j}]", n + 1
 
+        # transitions (flash, noir) : par-dessus tout, sous-titres compris ; edl `transitions` + b-roll `entree`
+        trs = transitions_of(edl_r, brolls, fps)
+        for j, t in enumerate(trs):
+            if t.get("type") not in TRANSITIONS:
+                print(f"transition « {t.get('type')} » inconnue (connues : {', '.join(TRANSITIONS)}) : ignorée")
+                continue
+            d = float(t.get("duree", TRANSITIONS[t["type"]][1]))
+            col = t.get("couleur") or TRANSITIONS[t["type"]][0]
+            ta = max(0.0, float(t["at"]) - d / 2)  # centrée sur la coupe : moitié avant, moitié après
+            graph.append(f"color=c={col}:s={w}x{h}:r={fps}:d={d:.3f},format=rgba,{transition_alpha(t['type'], d)},"
+                         f"setpts=PTS+{ta:.3f}/TB[tr{j}]")
+            graph.append(f"{v}[tr{j}]overlay=eof_action=pass:enable='between(t,{ta:.3f},{ta + d:.3f})'[vt{j}]")
+            v = f"[vt{j}]"
+
         args += ["-filter_complex", ";".join(graph), "-map", v, "-an", "-t", f"{total:.6f}",
                  "-r", str(fps), *venc(a.brouillon, final=True), "-video_track_timescale", "90000", "video.mp4"]
+        # chaque entrée (segments, b-roll, emojis) a son décodeur : sans limite, 12 cœurs = 12 fils et leurs images chacun
+        args = [x for y in args for x in ([*FF_THREADS, y] if y == "-i" else [y])]
+        args[1:1] = ["-filter_complex_threads", FF_THREADS[1]]
         run_in(args, tmp)
         stage(f"finition vidéo (b-roll, sous-titres, {len(emojis)} emojis)")
         th.join()

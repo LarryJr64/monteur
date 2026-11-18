@@ -44,8 +44,9 @@ def main(argv=None):
     for f in sorted(dossier.iterdir()):
         ext = f.suffix.lower()
         if ext not in VIDEO_EXT | AUDIO_EXT:
-            if f.is_file() and f.stem.lower().startswith("trame") and ext in (".txt", ".md"):
-                lignes.append(f"| {f.name} | trame | | | à lire : ordre, ton, durée, plans demandés |")
+            if f.is_file() and f.stem.lower().startswith(("trame", "guide", "montage")) and ext in (".txt", ".md"):
+                quoi = "guide de montage" if not f.stem.lower().startswith("trame") else "trame"
+                lignes.append(f"| {f.name} | {quoi} | | | à lire : ordre, ton, durée, plans demandés, règles de montage |")
             continue
         info = probe(f)
         t = find_transcript(root, f.as_posix()) or {}
@@ -54,8 +55,11 @@ def main(argv=None):
         video = ext in VIDEO_EXT and "width" in info
         typ, doute = classer(f.name, video, info["duration"], len(ws), conf)
         types.append(typ)
+        note = 'sans son' if not info['has_audio'] else 'non transcrit' if not t else ''
+        if typ == "parle" and info.get("width", 0) > info.get("height", 0):
+            note = (note + " ; " if note else "") + "tourné à l'horizontale : recadré en vertical, image moins nette (filmer en vertical)"
         lignes.append(f"| {f.name} | {typ}{' ?' if doute else ''} | {info['duration']:.1f} | "
-                      f"{len(ws) / max(info['duration'], 0.1):.1f} | {'sans son' if not info['has_audio'] else 'non transcrit' if not t else ''} |")
+                      f"{len(ws) / max(info['duration'], 0.1):.1f} | {note} |")
     m = mode(types)
     out = ["# Tri du dépôt", "", f"Mode : **{m}**", "",
            "| fichier | type | durée (s) | mots/s | note |", "|---|---|---|---|---|", *lignes, "",

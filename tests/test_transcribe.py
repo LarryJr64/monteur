@@ -197,3 +197,48 @@ def test_fillers_real_audio(tmp_path):
     after = next(w for w in t["words"] if "café" in w["w"].lower())
     assert fillers and all(before["end"] <= f["start"] and f["end"] <= after["start"] for f in fillers), t["words"]
     assert "[" in (tmp_path / ".monteur" / "takes.md").read_text(encoding="utf-8")
+
+
+def test_derive_anglais_detectee():
+    import transcribe as tr
+    w = lambda txt: [{"w": m, "p": 0.9} for m in txt.split()]
+    fr = w("J'ai réussi à signer le Nikki Beach avec zéro réseau et un petit budget " * 5)
+    derive = w("The code of the hotel are different from codes of the event so if you're a person " * 2) + fr
+    assert tr.derive_anglais(fr, "fr") < tr.DERIVE_MAX
+    assert tr.derive_anglais(derive, "fr") > tr.DERIVE_MAX
+    assert tr.derive_anglais(derive, "en") == 0
+
+
+def test_pourcent_recolle():
+    import transcribe as tr
+    w = tr.glue([{"w": "100", "start": 1.0, "end": 1.2, "p": 0.9}, {"w": "%", "start": 1.2, "end": 1.5, "p": 0.4}])
+    assert [x["w"] for x in w] == ["100%"]
+
+
+def test_majuscule_apres_pause_retiree_sauf_noms_propres():
+    import transcribe as tr
+    w = [{"w": x} for x in "j'ai réalisé Plein d'événements très bien à Maurice quand même Très plein Maurice".split()]
+    out = [x["w"] for x in tr.casse(w)]
+    assert out[2] == "plein" and out[10] == "très" and out[7] == "Maurice"
+
+
+def test_nouveau_lexique_parakeet_sans_retranscrire(tmp_path):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import transcribe
+    (tmp_path / "rushs").mkdir()
+    src = tmp_path / "rushs" / "x.mp4"
+    src.write_bytes(b"pas une vraie video")
+    tdir = tmp_path / ".monteur" / "transcripts"
+    tdir.mkdir(parents=True)
+    t = {"source": "rushs/x.mp4", "duration": 2.0, "language": "fr", "model": transcribe.PARAKEET,
+         "words": [{"w": "Mateo", "start": 0.1, "end": 0.5, "p": 0.9}], "silences": []}
+    (tdir / "x.json").write_text(transcribe.dump(t), encoding="utf-8")
+    st = src.stat()
+    (tdir / "x.cache").write_text(json.dumps({"mtime": st.st_mtime, "size": st.st_size, "model": transcribe.PARAKEET,
+                                              "lexique": None, "v": transcribe.CACHE_VERSION}), encoding="utf-8")
+    (tmp_path / "lex.txt").write_text("Matteo\n", encoding="utf-8")
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "transcribe.py"), "rushs", "--root", ".",
+                        "--lexique", "lex.txt"], cwd=tmp_path, capture_output=True, text=True, encoding="utf-8")
+    assert r.returncode == 0, r.stderr
+    assert "sans retranscrire" in r.stdout and "chargement du modèle" not in r.stdout
+    assert json.loads((tdir / "x.json").read_text(encoding="utf-8"))["words"][0]["w"] == "Matteo"

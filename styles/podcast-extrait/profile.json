@@ -1,0 +1,118 @@
+{
+  "rythme": {
+    "respiration_intra_s": 0.15,
+    "respiration_phrases_s": 0.32,
+    "coupe_avant_mot_s": 0.08,
+    "duree_moyenne_plan_s": 2.4,
+    "mediane_plan_s": 2.2,
+    "coupes_par_minute": 25,
+    "silence_max_s": 0.7,
+    "plans_quantiles": [
+      1.2,
+      1.7,
+      2.2,
+      3.0,
+      4.0
+    ],
+    "hook_plan_s": 2.5
+  },
+  "zooms": {
+    "par_minute": 4,
+    "intensite": 1.1,
+    "style": "doux",
+    "types": {
+      "doux": 0.6,
+      "cut": 0.4
+    },
+    "rampe_s": 1.0,
+    "sur_visage": true,
+    "une_coupe_sur": 4
+  },
+  "sous_titres": {
+    "actif": true,
+    "police": "Montserrat",
+    "gras": true,
+    "taille_pct_hauteur": 0.032,
+    "couleur": "#FFFFFF",
+    "couleur_mot_actif": "#FFD60A",
+    "contour": "#000000",
+    "epaisseur_contour": 5,
+    "position_y_pct": 0.72,
+    "mots_par_bloc": 4,
+    "majuscules": true,
+    "animation": "karaoke",
+    "couleur_mot_cle": "#FFD60A",
+    "mots_cles_par_bloc": 0,
+    "mots_cles_part_blocs": 0.0,
+    "emojis_par_minute": 0,
+    "zone_sure": true,
+    "graisse": 800,
+    "max_caracteres": 24
+  },
+  "audio": {
+    "lufs_cible": -14.0,
+    "musique": false,
+    "musique_db_sous_voix": -26,
+    "musique_lufs": -40,
+    "sfx_par_minute": 0,
+    "sfx_types": [],
+    "sfx_carton": null,
+    "voix_nettoyee": true
+  },
+  "broll": {
+    "part_pct": 0.05,
+    "duree_moy_s": 2.5,
+    "jamais_sur_hook": true,
+    "source": "videos_du_createur",
+    "couvre": "phrase",
+    "usage": "rare : un plan seulement quand l'invité cite quelque chose de très visuel"
+  },
+  "hook": {
+    "duree_s": 3,
+    "type": "choc",
+    "texte_a_l_ecran": true,
+    "formule": "la phrase la plus forte de l'extrait d'abord, titre de l'extrait à l'écran"
+  },
+  "version": 2,
+  "origine": "style de depart",
+  "style_depart": "podcast-extrait",
+  "references": [],
+  "format": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30
+  },
+  "references_atypiques": [],
+  "titres": {
+    "actif": true,
+    "style": "titre de l'extrait (6 mots au plus) en haut de l'image",
+    "quand": "accroche"
+  },
+  "transitions": [],
+  "graphismes": [],
+  "a_completer_par_claude": [
+    "sous_titres.police",
+    "sous_titres.couleurs",
+    "sous_titres.mots_par_bloc",
+    "sous_titres.animation",
+    "sous_titres.emojis",
+    "zooms.style",
+    "hook",
+    "broll.usage",
+    "titres",
+    "transitions",
+    "style_verbal"
+  ],
+  "cadrage": {
+    "visage_largeur": 0.38,
+    "visage_y": 0.34
+  },
+  "style_verbal": {
+    "duree_typique_s": 60,
+    "formules_hook": [],
+    "structure": "phrase forte → la question posée → la réponse complète → chute",
+    "cta": [],
+    "fin": "chute",
+    "registre": "tu"
+  }
+}

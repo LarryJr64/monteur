@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import sys
 import wave
@@ -286,3 +287,153 @@ def test_coupe_elargie_sur_l_energie_jamais_une_attaque_mangee(tmp_path):
     assert pieces[0]["start"] <= 1.00 + 1e-6  # l'attaque réelle (1,00) est gardée
     assert pieces[-1]["end"] >= 3.10 - 1e-6  # la fin réelle (3,10) aussi
     assert pieces[0]["start"] >= 0.75  # mais on ne remonte pas dans le silence
+
+
+def test_broll_plan_et_carton(tmp_path):
+    """Face caméra : `plan` (plans.json) donne source + départ et borne la durée au plan ; `carton` couvre le hook."""
+    root = setup(tmp_path)
+    (root / ".monteur" / "plans.json").write_text(json.dumps(
+        {"plans": {"P2": {"source": "broll/club.mp4", "start": 10.0, "end": 10.9}}}), encoding="utf-8")
+    res = pacing.normalize_edl(edl([seg(0.0, 1.6, note="hook"), seg(2.3, 7.0)],
+                                   broll=[{"plan": "p2", "at": 3.0, "duration": 2.0, "mot": "parle"},
+                                          {"source": "broll/anim_q.mp4", "at": 0.0, "duration": 1.5, "carton": True},
+                                          {"plan": "P9", "at": 4.0, "duration": 1.0}]), root, {})
+    srcs = {b["source"]: b for b in res["broll"]}
+    assert set(srcs) == {"broll/club.mp4", "broll/anim_q.mp4"}  # P9 inconnu : ignoré
+    assert srcs["broll/club.mp4"]["source_start"] == 10.0 and srcs["broll/club.mp4"]["duration"] <= 0.9 + 1e-6
+    assert srcs["broll/anim_q.mp4"]["at"] == 0.0
+
+
+def test_insert_a_lire_juste_avant_le_cta_garde_1_2_s(tmp_path):
+    """Logo sur la dernière phrase avant le CTA : gardé 1,2 s (mord le début du CTA) au lieu d'être retiré."""
+    root = setup(tmp_path)
+    res = pacing.normalize_edl(edl([seg(0.0, 4.6), seg(5.3, 7.0, note="cta")],
+                                   broll=[{"source": "broll/anim_logo.mp4", "at": 3.9, "duration": 1.5, "mot": "café",
+                                           "tenir": True, "texte": True}]), root, {})
+    assert len(res["broll"]) == 1 and res["broll"][0]["duration"] == pytest.approx(pacing.TENIR_MIN)
+
+
+def test_raccord_entre_segments_garde_la_respiration_du_createur(tmp_path):
+    # « parle du café. » puis « Salut tout le monde. » : au raccord, silence = respiration entre phrases, pas plus
+    root = setup(tmp_path)
+    profil = {"rythme": {"respiration_phrases_s": 0.12, "coupe_avant_mot_s": 0.1}}
+    res = pacing.normalize_edl(edl([seg(3.6, 4.6), seg(0.4, 1.6)]), root, profil)
+    tw = out_words(res, root)
+    cafe, salut = next(w for w in tw if w["w"] == "café."), next(w for w in tw if w["w"] == "Salut")
+    assert salut["start"] - cafe["end"] == pytest.approx(0.12, abs=0.015)  # respiration 0,12 partagée traîne + élan
+
+
+def fake_env(loud, total=4.0):
+    """Envelope sans fichier : -20 dB sur les plages `loud`, -70 dB ailleurs (tranches de 10 ms)."""
+    env = pacing.Envelope.__new__(pacing.Envelope)
+    t = np.arange(int(total / pacing.Envelope.STEP)) * pacing.Envelope.STEP
+    env.db = np.where(np.any([(t >= a) & (t < b) for a, b in loud], axis=0), -20.0, -70.0)
+    env.np = np
+    return env
+
+
+def test_vrai_silence_dans_un_mot_coupe_en_deux():
+    # Parakeet : « réussite » 1,0-2,0 collé à « ensuite », mais la voix se tait 1,4-1,8 (pause rangée dans le mot)
+    words = [W("réussite", 1.0, 2.0), W("ensuite", 2.0, 2.4)]
+    env = fake_env([(1.0, 1.4), (1.8, 2.4)])
+    pieces, _ = pacing._cut_plan(seg(0.9, 2.5), words, pacing._rythme({}), True, env)
+    assert len(pieces) == 2
+    (a0, b0, w0, _), (a1, b1, w1, _) = pieces
+    assert [w["w"] for w in w0] == ["réussite"] and [w["w"] for w in w1] == ["ensuite"]
+    assert 1.4 + pacing.TAIL_MIN <= b0 < a1 <= 1.8 - pacing.PRE_MIN  # coupe dans le silence, respiration gardée
+    assert a0 <= 1.0 and b1 >= 2.4  # aucune attaque ni fin mangée
+    assert env.silences(1.05, 2.35) == [pytest.approx((1.4, 1.8))]
+
+
+def test_jump_cut_au_vrai_silence_meme_echelle(tmp_path):
+    words = [W("a", 0.0, 0.5), W("b", 0.5, 1.0), W("c", 1.0, 1.5), W("d", 1.5, 2.0)]
+    env = fake_env([(0.0, 0.95), (1.05, 2.0)])  # 100 ms de vrai silence entre « b » et « c »
+    r = {"plan_max_s": 1.0, "respiration_intra_s": 0.08}
+    out, jumps = pacing._jump_cuts([(0.0, 2.0, words, math.inf)], r, 30, env)
+    assert [(round(a, 2), round(b, 2), [w["w"] for w in pw]) for a, b, pw, _ in out] == \
+        [(0.0, 0.95, ["a", "b"]), (1.05, 2.0, ["c", "d"])] and jumps == {1}
+    assert out[1][0] - out[0][1] >= pacing.JUMP_FRAMES / 30 - 1e-9  # ≥ 3 images retirées : le saut se voit
+    # sans son : plus grande frontière de mots ; le morceau après le jump garde l'échelle (pas de zoom ajouté)
+    root = setup(tmp_path)
+    res = pacing.normalize_edl(edl([seg(0.0, 7.0, zoom=1.2)]), root, {"rythme": {"plan_max_s": 1.0}})
+    ps = res["segments"]
+    assert all(s["end"] - s["start"] <= 1.0 + 1e-6 for s in ps if s["end"] - s["start"] > 0)
+    assert ps[0]["zoom"] == 1.2 and ps[1]["zoom"] == 1.2 and ps[1]["zoom_type"] == "cut"
+    assert pacing.normalize_edl(edl([seg(0.0, 7.0)]), root, {})["pacing"]["morceaux"] == 4  # sans profil : aucun jump
+
+
+def test_broll_sur_le_premier_mot_apres_le_hook_garde(tmp_path):
+    """Avancé de 2 images, il chevauchait le hook et était retiré : il part à la fin du hook."""
+    root = setup(tmp_path)
+    prof = {"rythme": {"coupe_avant_mot_s": 0.0, "respiration_phrases_s": 0.0}}
+    res = pacing.normalize_edl(edl([seg(0.0, 1.6, note="hook"), seg(2.3, 7.0)],
+                                   broll=[{"source": "y.mp4", "at": 1.3, "duration": 1.0, "mot": "Aujourd'hui"}]),
+                               root, prof)
+    hook_fin = res["segments"][0]["end"] - res["segments"][0]["start"]
+    assert len(res["broll"]) == 1 and res["broll"][0]["at"] == pytest.approx(hook_fin, abs=1e-3)
+
+
+def test_plans_enchaines_sans_mot(tmp_path):
+    """Plan sans mot collé au précédent : le suit, garde sa durée courte, jamais plus long que le plan."""
+    root = setup(tmp_path)
+    (root / ".monteur" / "plans.json").write_text(json.dumps(  # P1 court : P2 tient encore dans la phrase
+        {"plans": {"P1": {"source": "b/a.mp4", "start": 0.0, "end": 0.5},
+                   "P2": {"source": "b/b.mp4", "start": 3.0, "end": 3.5}}}), encoding="utf-8")
+    res = pacing.normalize_edl(edl([seg(0.0, 7.0)], broll=[{"plan": "P1", "at": 3.6, "duration": 0.8, "mot": "parle"},
+                                                           {"plan": "P2", "at": 4.4, "duration": 0.6}]),
+                               root, {"broll": {"duree_moy_s": 2.2}})
+    a, b = res["broll"]
+    assert b["at"] == pytest.approx(a["at"] + a["duration"], abs=1e-3)
+    assert b["duration"] == pytest.approx(0.5, abs=1e-3)  # 0,6 demandé (pas forcé à 1,1), borné au plan (0,5)
+    assert not any(k.startswith("_") for x in res["broll"] for k in x)
+
+
+def test_plan_enchaine_jamais_au_dela_de_sa_phrase(tmp_path):
+    """Un plan enchaîné s'arrête 0,3 s après le dernier mot de la phrase du plan qu'il suit (pas sur la phrase
+    suivante) ; `deborde` le laisse filer (même sujet) ; ce qui reste sous 0,4 s est retiré."""
+    root = setup(tmp_path)
+    (root / ".monteur" / "plans.json").write_text(json.dumps(
+        {"plans": {"P1": {"source": "b/a.mp4", "start": 0.0, "end": 5.0},
+                   "P2": {"source": "b/b.mp4", "start": 0.0, "end": 5.0}}}), encoding="utf-8")
+
+    def rendu(moy=1.0, **k):
+        return pacing.normalize_edl(edl([seg(0.0, 7.0)], broll=[
+            {"plan": "P1", "at": 2.4, "duration": 1.0, "mot": "Aujourd'hui"},
+            {"plan": "P2", "at": 3.4, "duration": 1.5, **k}]), root, {"broll": {"duree_moy_s": moy}})
+    res = rendu()
+    fin = next(w for w in out_words(res, root) if w["w"] == "Le")["start"]  # début de la phrase suivante
+    a, b = res["broll"]
+    assert b["at"] == pytest.approx(a["at"] + a["duration"], abs=1e-3)
+    assert b["at"] + b["duration"] == pytest.approx(fin, abs=1e-3)  # 1,5 s demandées, coupé à sa phrase
+    assert rendu(deborde=True)["broll"][1]["duration"] == pytest.approx(1.5, abs=1e-3)
+    assert len(rendu(moy=2.2)["broll"]) == 1  # le 1er couvre déjà la phrase : le suivant n'a plus la place
+
+
+def test_coupe_sans_retrait_et_echelle_alternee(tmp_path):
+    words = [W("a", 1.5, 2.0), W("b", 2.0, 2.5), W("c", 2.5, 3.0), W("d", 3.0, 3.5)]
+    env = fake_env([(1.5, 3.5)], total=6.0)  # parole continue : aucune coupe sans retirer de la voix
+    r = {"plan_max_s": 1.2, "respiration_intra_s": 0.08}
+    assert len(pacing._jump_cuts([(1.5, 3.5, words, math.inf)], r, 30, env)[0]) == 1  # figé
+    out, jumps = pacing._jump_cuts([(1.5, 3.5, words, math.inf)], r, 30, env, sans_retrait=True)
+    assert [(a, b) for a, b, _, _ in out] == [(1.5, 2.5), (2.5, 3.5)] and jumps == {1}  # rien retiré
+    # profil qui change d'échelle à chaque coupe : 1 ↔ intensité, coupe sèche (« raccord », pas un zoom animé)
+    root = setup(tmp_path)
+    prof = {"rythme": {"plan_max_s": 1.0}, "zooms": {"coupes_echelle": True, "intensite": 1.2, "fin": True}}
+    ps = pacing.normalize_edl(edl([seg(0.0, 7.0)]), root, prof)["segments"]
+    zs = [s.get("zoom", 1.0) for s in ps]
+    assert all(z1 != z2 for z1, z2 in zip(zs, zs[1:])) and set(zs) == {1.0, 1.2}
+    assert {s.get("zoom_type") for s in ps if s.get("zoom", 1.0) > 1} == {"raccord"}
+    assert ps[-1]["zoom"] == 1.0 and ps[-2]["zoom"] == 1.2  # fin sur le plan large
+    sec = pacing.normalize_edl(edl([seg(0.0, 7.0)], masquer_raccords=False), root, prof)["segments"]
+    assert all(s.get("zoom_type") != "raccord" for s in sec[:-2])  # l'edl tranche : coupes sèches même échelle
+
+
+def test_premier_mot_colle_au_mot_d_avant_commence_au_creux():
+    # « oui, » 1,0-1,5 collé à « dans » 1,5-1,7 dans la transcription, mais la voix de « dans » part à 1,44
+    words = [W("oui,", 1.0, 1.5), W("dans", 1.5, 1.7), W("quinze", 1.7, 2.0)]
+    env = fake_env([(1.0, 1.40), (1.44, 2.0)])
+    (a, *_), *_ = pacing._cut_plan(seg(1.5, 2.1), words, pacing._rythme({}), True, env)[0]
+    assert 1.40 <= a <= 1.44  # « dans » entier, rien de « oui »
+    suite = seg(0.9, 1.5)  # « oui » gardé par le segment d'avant : on ne le reprend pas
+    (a, *_), *_ = pacing._cut_plan(seg(1.5, 2.1), words, pacing._rythme({}), True, env, suite)[0]
+    assert a >= 1.47

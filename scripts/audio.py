@@ -13,19 +13,22 @@ Débruitage : RNNoise (ffmpeg arnndn, modèle Xiph d'origine std.rnnn embarqué)
 `fort` utilise ClearerVoice MossFormer2 ou DeepFilterNet3 s'ils sont installés (PyTorch, lent), sinon RNNoise à 95 %.
 """
 import argparse
+import functools
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import statistics
 import wave
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import die, ffmpeg  # noqa: E402
+from common import MUSIQUE_DB_DEFAUT, die, ffmpeg  # noqa: E402
 
 SR = 48000
 HOP = 0.01  # trame d'analyse : 10 ms
@@ -279,6 +282,46 @@ def _close(mask, dur, value):
     return m
 
 
+def beats(path, duree, debut=0.0, sr=11025):
+    """Temps des temps forts (s, depuis `debut` dans le morceau) : flux spectral → tempo par autocorrélation
+    (70-180 BPM) → grille calée sur la phase la plus forte. [] si le morceau n'a pas de pulsation nette."""
+    out, _ = _ff(["-v", "error", "-ss", f"{debut:.3f}", "-t", f"{duree:.3f}", "-i", str(path), "-vn",
+                  "-f", "f32le", "-ac", "1", "-ar", str(sr), "-"])
+    x = np.frombuffer(out, np.float32)
+    hop, n = 128, 1024
+    if len(x) < sr * 2:
+        return []
+    fr = np.lib.stride_tricks.sliding_window_view(x, n)[::hop] * np.hanning(n)
+    mag = np.log1p(np.abs(np.fft.rfft(fr, axis=1)))
+    flux = np.maximum(0, np.diff(mag, axis=0)).sum(1)
+    flux = flux - np.convolve(flux, np.ones(16) / 16, "same")  # retire la tendance (montées de volume)
+    flux = np.maximum(flux, 0)
+    fps = sr / hop
+    ac = np.correlate(flux, flux, "full")[len(flux) - 1:]
+    lo, hi = int(fps * 60 / 180), int(fps * 60 / 70)
+    if hi >= len(ac) or ac[0] <= 0:
+        return []
+    lag = lo + int(np.argmax(ac[lo:hi]))
+    if ac[lag] < 0.1 * ac[0]:  # pas de pulsation (nappe, piano libre) : on ne cale rien
+        return []
+    phase = max(range(lag), key=lambda ph: flux[ph::lag].sum())
+    # suivi : chaque temps recalé sur le pic réel autour de la prédiction (le tempo entier en trames dériverait)
+    out, i, r = [], phase, max(1, lag // 4)
+    while i < len(flux):
+        a = max(0, i - r)
+        j = a + int(np.argmax(flux[a:i + r + 1]))
+        out.append(j)
+        i = j + lag
+    # flux[j] monte quand l'attaque entre dans la fenêtre j+1 (qui finit à (j+1)·hop + n) : instant ≈ j·hop + n
+    return [round((j * hop + n) / sr, 3) for j in out]
+
+
+def cale_sur_temps(t, temps, avant=0.15, apres=0.05):
+    """Instant `t` ramené sur le temps fort le plus proche dans [t-avant, t+apres] (jamais en retard sur le mot)."""
+    proches = [b for b in temps if t - avant <= b <= t + apres]
+    return min(proches, key=lambda b: abs(b - t)) if proches else t
+
+
 def duck_envelope(mask, duck_db, lift_db=8.0, attack=0.15, release=0.4):
     """Gain musique (dB) par trame : `duck_db` pendant la parole, +lift_db dans les pauses.
     Rampe linéaire en dB : descente en `attack` (anticipée, finie au premier mot), remontée en `release`."""
@@ -313,8 +356,9 @@ def _active_rms_db(x):
 def finish_mix(voice_wav, edl_rendu, profile, root, wav_out):
     """Voix montée + musique (bouclée, duckée) + bruitages → wav stéréo 48 kHz normalisé
     (`profile.audio.lufs_cible`, défaut -14 LUFS, true peak ≤ -1 dBTP). edl_rendu : dict ou chemin d'edl.rendu.json.
-    Musique : edl.music.volume_db, sinon audio.musique_db_sous_voix, sinon musique_lufs - lufs_cible (défaut -18 dB
-    sous la voix), duckée d'après l'énergie de la voix. Bruitages : edl.sfx[].type → assets/sfx/<type>.wav.
+    Musique : edl.music.volume_db, sinon audio.musique_db_sous_voix, sinon musique_lufs - lufs_cible (défaut
+    MUSIQUE_DB_DEFAUT sous la voix), duckée d'après l'énergie de la voix. Bruitages : edl.sfx[].type → assets/sfx/<type>.wav,
+    point fort (ancre) calé 1 image avant `at`.
     Renvoie {"lufs", "true_peak_db", "lra", "musique", "musique_db_sous_voix", "sfx_places", "sfx_manquants", …}."""
     if not isinstance(edl_rendu, dict):
         edl_rendu = json.loads(Path(edl_rendu).read_text(encoding="utf-8"))
@@ -335,25 +379,27 @@ def finish_mix(voice_wav, edl_rendu, profile, root, wav_out):
         src = root / music["source"]
         if not src.exists():
             die(f"musique introuvable : {src}")
-        out, _ = _ff(["-v", "error", "-stream_loop", "-1", "-i", str(src), "-vn", "-t", f"{n / SR:.6f}",
+        out, _ = _ff(["-v", "error", "-stream_loop", "-1", "-ss", f"{float(music.get('debut_s', 0)):.3f}",
+                      "-i", str(src), "-vn", "-t", f"{n / SR:.6f}",
                       "-f", "f32le", "-ac", "2", "-ar", str(SR), "-"])
         mus = np.frombuffer(out, np.float32).reshape(-1, 2)[:n]
         mus = np.pad(mus, ((0, n - len(mus)), (0, 0)))
         if "volume_db" in music:
             rel = music["volume_db"]
-        elif "musique_db_sous_voix" in a:
+        elif a.get("musique_db_sous_voix") is not None:
             rel = a["musique_db_sous_voix"]
-        elif "musique_lufs" in a:
+        elif a.get("musique") and a.get("musique_lufs") is not None:
             rel = a["musique_lufs"] - target
         else:
-            rel = -18
+            rel = MUSIQUE_DB_DEFAUT
         rel = float(min(max(rel, -30), -6))
         mus_db = _active_rms_db(mus)
         if mus_db > -80:
             lift = 8.0  # remontée dans les pauses ≥ 0,6 s et à la fin (sans parole : tout au niveau pause)
             g = duck_envelope(mask, lv + rel - mus_db, lift)
             gain = 10 ** (np.interp(np.arange(n) / SR, np.arange(len(g)) * HOP, g) / 20)
-            mix += _fade(mus, SR, 0.05, min(1.5, n / SR / 4)) * gain[:, None].astype(np.float32)
+            # pleine (niveau pause) après le dernier mot, fondu court sur la toute fin
+            mix += _fade(mus, SR, 0.05, min(0.4, n / SR / 4)) * gain[:, None].astype(np.float32)
             res.update(musique=True, musique_db_sous_voix=rel, remontee_pauses_db=lift)
 
     fps = (edl_rendu.get("format") or {}).get("fps", 30)
@@ -363,7 +409,10 @@ def finish_mix(voice_wav, edl_rendu, profile, root, wav_out):
             res["sfx_manquants"].append(s.get("type"))
             continue
         fx = load(f, SR, 2)
-        start = int(round((float(s["at"]) - 4 / fps) * SR))  # le son part ~4 images avant l'image visée
+        if s.get("duree_s"):  # son écourté (coup du carton avant le 1er tic) : fondu de sortie court
+            d = float(s["duree_s"])
+            fx = _fade(fx[:int(d * SR)], SR, 0.0, min(0.05, d / 2))
+        start = int(round(depart(f, float(s["at"]), fps) * SR))
         fx = fx[max(0, -start):]
         start = max(0, start)
         fx = fx[:max(0, n - start)]
@@ -395,6 +444,92 @@ def finish_mix(voice_wav, edl_rendu, profile, root, wav_out):
     return res
 
 
+@functools.lru_cache(None)
+def ancre(path):
+    """Instant (s) du point fort d'un bruitage dans son fichier, d'après son nom (= son type) : crête RMS pour un
+    souffle (whoosh, swoosh), FIN pour un riser (il monte vers la coupe), attaque pour le reste (impact, pop, click…)."""
+    nom = Path(path).stem.lower()
+    x = load(path)
+    if "riser" in nom:
+        return len(x) / SR
+    db = _frames_db(x, SR)
+    if "whoosh" in nom or "swoosh" in nom:
+        return float(np.argmax(db)) * HOP
+    return float(np.argmax(db > db.max() - 12)) * HOP
+
+
+def depart(path, at, fps):
+    """Début du fichier pour que son point fort tombe 1 image avant `at` (l'œil voit la coupe, l'oreille l'a déjà)."""
+    return at - 1 / fps - ancre(str(path))
+
+
+FAMILLES = {"whoosh": ("whoosh", "whoosh_2", "whoosh_3", "swoosh"), "pop": ("pop", "pop_2")}
+NIVEAUX_CARTON = {"impact": -8.0, "tic": -20.0, "riser": -14.0}  # dB sous la voix si la référence ne dit rien
+
+
+def _duree(path):
+    with wave.open(str(path)) as w:
+        return w.getnframes() / w.getframerate()
+
+
+def carton_sfx(carton, appris, fps=30):
+    """Bruitages d'un carton d'ouverture (b-roll `carton: true`) d'après `audio.sfx_carton` du profil (appris sur la
+    référence) : impact sur l'entrée, un tic à chaque temps (intervalle appris), riser qui finit sur la coupe de sortie."""
+    a = float(carton["at"])
+    fin = a + float(carton["duration"])
+    niv = {**NIVEAUX_CARTON, **(appris.get("niveaux_db") or {})}
+    out = []
+    if appris.get("impact"):
+        imp = {"type": "impact", "at": a, "volume_db": niv["impact"]}
+        if appris.get("premier_tic_s"):  # le coup du pro s'éteint avant le 1er tic ; une traîne de 1 s les masquerait
+            imp["duree_s"] = round(float(appris["premier_tic_s"]), 3)
+        out.append(imp)
+    iv = appris.get("intervalle_s")
+    if iv and iv >= 2 / fps:
+        # le fichier de la famille dont la durée colle à l'intervalle (un whoosh de 0,7 s tous les 0,27 s = bouillie)
+        noms = [n for n in FAMILLES.get(appris.get("tic") or "whoosh", (appris.get("tic"),)) if (SFX_DIR / f"{n}.wav").exists()]
+        tic = min(noms, key=lambda n: abs(_duree(SFX_DIR / f"{n}.wav") - iv)) if noms else "swoosh"
+        t = a + float(appris.get("premier_tic_s") or iv)
+        while t <= fin - iv / 2:
+            out.append({"type": tic, "at": round(t, 3), "volume_db": niv["tic"]})
+            t += iv
+    if appris.get("riser"):
+        out.append({"type": "riser", "at": round(fin, 3), "volume_db": niv["riser"]})
+    return [dict(x, carton=True) for x in out]
+
+
+def carton_appris(path, found, fin):
+    """Ce que la référence fait sonner sur son carton muet [0, fin] (détections HORS parole, donc fiables) : temps,
+    impact d'entrée, tics réguliers (intervalle médian, type deviné), riser final, niveaux (dB par rapport à la voix,
+    comme volume_db). found = [{"t", "type"}] du carton. None s'il n'y a presque rien."""
+    found = sorted(found, key=lambda f: f["t"])
+    if len(found) < 2:
+        return None
+    x = load(path)
+    voix = _active_rms_db(x[int(fin * SR):] if len(x) > (fin + 1) * SR else x)
+
+    def niveau(a, b):
+        return round(_active_rms_db(x[int(a * SR):max(int(b * SR), int(a * SR) + 480)]) - voix, 1)
+
+    impact = found[0]["t"] < 0.1
+    reste = found[1:] if impact else found
+    final = [f for f in reste if f["type"] == "riser" and f["t"] > fin * 2 / 3]
+    tics = [f for f in reste if f not in final]
+    ts = [f["t"] for f in reste]
+    iv = round(statistics.median(b - a for a, b in zip(ts, ts[1:])), 3) if len(ts) >= 2 else None
+    types = Counter(f["type"] for f in tics if f["type"] != "riser")
+    niv = {}
+    if impact:
+        niv["impact"] = niveau(0, min(0.25, ts[0] if ts else 0.25))
+    if tics and iv:
+        niv["tic"] = round(statistics.median(niveau(f["t"], f["t"] + min(iv, 0.25)) for f in tics), 1)
+    if final:
+        niv["riser"] = niveau(final[0]["t"], fin)
+    return {"duree_s": round(fin, 3), "t": [f["t"] for f in found], "impact": impact, "intervalle_s": iv,
+            "premier_tic_s": ts[0] if ts else None, "tic": types.most_common(1)[0][0] if types else "whoosh",
+            "riser": bool(final), "types": dict(Counter(f["type"] for f in found)), "niveaux_db": niv}
+
+
 # ---------- repérage des bruitages dans les références ----------
 
 def detect_sfx(audio_path, words, min_gap=0.25):
@@ -409,7 +544,7 @@ def detect_sfx(audio_path, words, min_gap=0.25):
     S = np.abs(np.fft.rfft(fr, axis=1))
     L = np.log1p(S * 100)
     flux = np.maximum(np.diff(L, axis=0), 0).sum(1)
-    flux = np.r_[0, flux]
+    flux = np.r_[L[0].sum(), flux]  # un coup posé sur la toute 1re image compte (attaque depuis le silence)
     thr = np.median(flux) + 6 * np.median(np.abs(flux - np.median(flux))) + 1e-9
     t = np.arange(len(flux)) * hop / sr
     e_db = 10 * np.log10((S ** 2).sum(1) + 1e-12)

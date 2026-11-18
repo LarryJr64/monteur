@@ -4,6 +4,7 @@ Aussi le recalage des coupes sur les mots, partagé par render.py et export_xml.
 pour que vidéo, XML et SRT aient exactement les mêmes temps.
 """
 import argparse
+import math
 import json
 import os
 import re
@@ -81,7 +82,8 @@ def snapped_segments(edl, root):
     for i, s in enumerate(edl["segments"]):
         tr = load_transcript(root, s["source"])
         words = tr["words"] if tr else []
-        start, end = snap(s["start"], words), snap(s["end"], words)
+        # morceaux de pacing (`piece`) : bords déjà posés sur les mots et l'énergie, parfois dans un mot (vraie pause)
+        start, end = (s["start"], s["end"]) if "piece" in s else (snap(s["start"], words), snap(s["end"], words))
         if end - start < 1 / fps:
             start, end = s["start"], s["end"]
         frames = max(1, round((end - start) * fps))
@@ -106,16 +108,21 @@ def timeline_words(segments, root):
     v2 : `cle` = mot de `mots_cles` du segment ; `emoji` du segment posé sur son 1er mot-clé (sinon 1er mot)."""
     res, groups = [], {}
     for i, s in enumerate(segments):
-        tr = load_transcript(root, s["source"])
+        tr = load_transcript(root, s["source"]) if not s.get("muet") else None  # segment muet : rien à sous-titrer
         keys = {norm(k) for k in s.get("mots_cles") or [] if norm(k)}
         # pacing découpe un segment en morceaux (`seg` = segment d'origine) : un seul emoji par segment d'origine
         group = groups.setdefault(s.get("seg", i), [s.get("emoji"), []])
+        premier = True
         for w in (tr or {}).get("words", []):
             mid = (w["start"] + w["end"]) / 2
-            if s["start"] <= mid < s["end"]:
+            # mot qui finit au tout début du segment (ou commence à sa toute fin) : à peine entendu, pas affiché
+            if s["start"] <= mid < s["end"] and w["end"] > s["start"] + 0.03 and w["start"] < s["end"] - 0.03:
                 a = s["offset"] + max(0.0, w["start"] - s["start"])
                 b = s["offset"] + min(s["end"], w["end"]) - s["start"]
                 res.append({"w": w["w"].strip(), "start": a, "end": max(b, a + 0.05)})
+                if premier and s.get("seg", i) != segments[i - 1].get("seg", i - 1) if i else False:
+                    res[-1]["coupe"] = True  # 1er mot après une vraie coupe (pas un morceau du même segment)
+                premier = False
                 if is_filler(w):  # hésitation gardée au son (note « garde », non isolée) : jamais à l'écran
                     res[-1]["filler"] = True
                 if keys and is_keyword(w["w"], keys):
@@ -141,29 +148,73 @@ def clean_words(words):
                 out[-1]["fin"] = True
             continue
         fin = bool(SENTENCE_END.search(text))
+        virgule = bool(re.search(r"[,;:]$", text))
         text = re.sub(r"[,;:.…]+$", "", text)  # garde ? et ! qui portent le ton
         text = re.sub(r"\s+([?!])", r" \1", text)
         # « l' idée », « l 'hormone » (découpage Whisper), « abonne -toi »
-        extra = {k: w[k] for k in ("cle", "emoji") if w.get(k)}
+        extra = {k: w[k] for k in ("cle", "emoji", "coupe") if w.get(k)}
         if out and (out[-1]["w"].endswith("'") or re.match(r"'|-\w", text)):
             prev = out.pop()
             w = dict(w, start=prev["start"])
             text = prev["w"] + text
             extra = {**{k: prev[k] for k in ("cle", "emoji") if prev.get(k)}, **extra}
-        out.append({"w": text, "start": w["start"], "end": w["end"], "fin": fin, **extra})
+        out.append({"w": text, "start": w["start"], "end": w["end"], "fin": fin, "virgule": virgule, **extra})
     return out
 
 
-def make_blocks(words, per_block=3):
-    """Groupes de `per_block` mots, jamais à travers une pause > 0,4 s ni une fin de phrase."""
-    blocks, cur = [], []
+# mots outils : jamais seuls en fin de bloc (« je | pense », « de | la vie ») quand le bloc suivant peut les prendre
+OUTILS = set("je tu il elle on nous vous ils elles en de du des le la les un une à au aux et ou qui que ne se ce "
+             "sa son ses mon ma mes ton ta tes leur pour par dans sur avec mais donc car si y plus très me te lui leurs nos vos notre votre".split())
+
+
+def _decoupe(ph, k, per_block, max_car):
+    """Meilleure découpe de la phrase en k blocs (ou None) : blocs égaux, de préférence après une virgule, jamais un
+    mot outil en fin de bloc ; chaque bloc ≤ per_block mots et ≤ max_car caractères (sauf mot seul)."""
+    n, cible = len(ph), len(ph) / k
+    best = {(0, 0): (0.0, [])}
+    for j in range(1, k + 1):
+        for i in range(j, n + 1):
+            for d in range(j - 1, i):
+                if (d, j - 1) not in best or i - d > per_block or                         (max_car and i - d > 1 and len(" ".join(w["w"] for w in ph[d:i])) > max_car):
+                    continue
+                last = ph[i - 1]
+                c = best[(d, j - 1)][0] + (i - d - cible) ** 2
+                if i < n:
+                    c += 10 * (norm(last["w"]) in OUTILS) - 5 * last.get("virgule", False)
+                if (i, j) not in best or c < best[(i, j)][0]:
+                    best[(i, j)] = (c, best[(d, j - 1)][1] + [ph[d:i]])
+    return best.get((n, k), (0, None))[1]
+
+
+def make_blocks(words, per_block=3, max_car=None):
+    """Blocs d'au plus `per_block` mots, jamais à travers une pause > 0,4 s, une fin de phrase ni une coupe qui
+    ouvre une nouvelle phrase (majuscule au 1er mot d'un segment). Chaque phrase est répartie en blocs égaux
+    (« Nul n'est prophète | en son pays », pas « Nul n'est prophète | en son | pays »), coupés de préférence après
+    une virgule, jamais sur un mot outil seul en fin de bloc (_decoupe).
+    `max_car` : aucun bloc plus long (espaces comprises) ; on ajoute des blocs, toujours égaux, jusqu'à tenir."""
+    phrases, cur = [], []
     for w in clean_words(words):
-        if cur and (len(cur) >= per_block or w["start"] - cur[-1]["end"] > PAUSE_MAX or cur[-1]["fin"]):
-            blocks.append(cur)
+        if cur and (w["start"] - cur[-1]["end"] > PAUSE_MAX or cur[-1]["fin"]
+                    or (w.get("coupe") and w["w"][:1].isupper())):
+            phrases.append(cur)
             cur = []
         cur.append(w)
     if cur:
-        blocks.append(cur)
+        phrases.append(cur)
+    blocks = []
+    for ph in phrases:
+        k = math.ceil(len(ph) / per_block)
+        while k < len(ph) and not _decoupe(ph, k, per_block, max_car):
+            k += 1
+        best = _decoupe(ph, k, per_block, max_car)
+        # un bloc de plus plutôt qu'un mot outil en fin de bloc (la pénalité seule cède quand max_car serre)
+        for k2 in range(k + 1, min(k + 2, len(ph)) + 1):
+            if not any(norm(b[-1]["w"]) in OUTILS for b in best[:-1]):
+                break
+            alt = _decoupe(ph, k2, per_block, max_car)
+            if alt and sum(norm(b[-1]["w"]) in OUTILS for b in alt[:-1]) < sum(norm(b[-1]["w"]) in OUTILS for b in best[:-1]):
+                best = alt
+        blocks += best
     res = []
     for i, b in enumerate(blocks):
         end = b[-1]["end"] + 0.25
@@ -211,8 +262,27 @@ def esc(text):
     return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")")
 
 
-# polices embarquées (OFL, voir fonts/OFL-*.txt) : déjà grasses, pas de faux gras
-BUNDLED = {"montserrat": "Montserrat ExtraBold", "poppins": "Poppins ExtraBold", "anton": "Anton", "bebas neue": "Bebas Neue"}
+# polices embarquées (OFL, voir fonts/OFL-*.txt) par (famille, graisse) → (nom ASS, fichier) : pas de faux gras
+BUNDLED = {("montserrat", 800): ("Montserrat ExtraBold", "Montserrat-ExtraBold.ttf"),
+           ("montserrat", 600): ("Montserrat SemiBold", "Montserrat-SemiBold.ttf"),
+           ("inter tight", 600): ("Inter Tight SemiBold", "InterTight-SemiBold.ttf"),
+           ("poppins", 800): ("Poppins ExtraBold", "Poppins-ExtraBold.ttf"),
+           ("anton", 400): ("Anton", "Anton-Regular.ttf"), ("bebas neue", 400): ("Bebas Neue", "BebasNeue-Regular.ttf")}
+ALIAS = {"inter": "inter tight"}
+
+
+def bundled(police):
+    """Graisses embarquées de la famille : {graisse: (nom ASS, fichier)} (vide si elle n'est pas embarquée)."""
+    fam = ALIAS.get(police.lower(), police.lower())
+    return {g: v for (f, g), v in BUNDLED.items() if f == fam}
+
+
+def graisse(st):
+    """`graisse` (400/600/800) du profil ; à défaut 800 si `gras` (le rendu d'avant), sinon 400."""
+    try:
+        return int(float(st.get("graisse")))
+    except (TypeError, ValueError):
+        return 800 if st.get("gras", True) else 400
 WIN_FILES = {"arial black": "ariblk", "impact": "impact", "arial": "arial"}
 
 
@@ -229,8 +299,9 @@ def _installed(name):
 def font_name(st):
     """(nom ASS, gras ?) : police embarquée si possible, sinon système, sinon repli embarqué puis Arial."""
     want = st.get("police") or "Montserrat"
-    if want.lower() in BUNDLED:
-        return BUNDLED[want.lower()], False
+    faces = bundled(want)
+    if faces:  # la graisse embarquée la plus proche de celle demandée
+        return faces[min(faces, key=lambda g: abs(g - graisse(st)))][0], False
     if _installed(want):
         return want, bool(st.get("gras", True))
     if (FONTS_DIR / "Montserrat-ExtraBold.ttf").exists():
@@ -239,13 +310,25 @@ def font_name(st):
     return "Arial", bool(st.get("gras", True))
 
 
-FONT_FILES = {"Montserrat ExtraBold": "Montserrat-ExtraBold.ttf", "Poppins ExtraBold": "Poppins-ExtraBold.ttf",
-              "Anton": "Anton-Regular.ttf", "Bebas Neue": "BebasNeue-Regular.ttf"}
+FONT_FILES = dict(BUNDLED.values())
 KW_SCALE = 115   # mot-clé à 115 % (teardown : 110-120 %)
 POP_MS = 100     # pop 80 → 100 % en 100 ms (teardown : 80-120 ms)
 ENTREE_MS = 120  # glissé / fondu / rebond : 4 images à 30 i/s
-ANIMATIONS = ("pop", "rebond", "glisse", "fondu", "karaoke", "mot_par_mot", "surlignage", "aucune")
+ANIMATIONS = ("pop", "rebond", "glisse", "fondu", "flou", "karaoke", "mot_par_mot", "surlignage", "aucune")
 LINE_H = 1.1     # hauteur d'une ligne libass ≈ 1,1 × Fontsize (mesuré sur les rendus)
+
+
+def metrics(st, height):
+    """(police ASS, fichier mesuré, Fontsize, em px, interlettrage px) : `interlettrage_pct` est en % de l'em,
+    comme letter-spacing en CSS ; libass l'ajoute en px après chaque lettre (Spacing)."""
+    font, _ = font_name(st)
+    ttf = FONTS_DIR / FONT_FILES.get(font, "Montserrat-ExtraBold.ttf")  # police système : mesurée comme Montserrat
+    cap_r, em_r = font_ratios(ttf) or (None, 0.64)
+    if font not in FONT_FILES:
+        cap_r = None
+    size = round(st["taille_pct_hauteur"] * height / (cap_r or CAP_RATIO))
+    em = size * em_r
+    return font, ttf, size, em, float(st.get("interlettrage_pct") or 0) / 100 * em
 
 
 def layout(words, st, width, height, face_at=None):
@@ -255,13 +338,7 @@ def layout(words, st, width, height, face_at=None):
     Zone sûre (`zone_sure`) : rien sous 80 % de la hauteur, marge droite élargie (boutons TikTok/Reels)."""
     from PIL import ImageFont
     st = {**DEFAULT_ST, **(st or {})}
-    font, _ = font_name(st)
-    ttf = FONTS_DIR / FONT_FILES.get(font, "Montserrat-ExtraBold.ttf")  # police système : mesurée comme Montserrat
-    cap_r, em_r = font_ratios(ttf) or (None, 0.64)
-    if font not in FONT_FILES:
-        cap_r = None
-    size = round(st["taille_pct_hauteur"] * height / (cap_r or CAP_RATIO))
-    em = size * em_r
+    font, ttf, size, em, ls = metrics(st, height)
     safe = bool(st.get("zone_sure"))
     ml = width // 12
     mr = round(width * 0.15) if safe else ml
@@ -270,14 +347,14 @@ def layout(words, st, width, height, face_at=None):
     y0 = st["position_y_pct"] * height
     out = []
     part = st.get("mots_cles_part_blocs")
-    blocks = make_blocks(words, int(st["mots_par_bloc"]))
+    blocks = make_blocks(words, int(st["mots_par_bloc"]), st.get("max_caracteres"))
     if part and part < 0.85:  # au-delà : un mot actif par bloc (karaoké), pas un dosage de mots-clés
         blocks = dose_keywords(blocks, part)
     for blk in blocks:
         ws = blk["words"]
         toks = [w["w"].upper() if st["majuscules"] else w["w"] for w in ws]
         kw = next((i for i, w in enumerate(ws) if w.get("cle")), None)
-        widths = [pil.getlength(t) * (KW_SCALE / 100 if i == kw else 1) for i, t in enumerate(toks)]
+        widths = [(pil.getlength(t) + ls * len(t)) * (KW_SCALE / 100 if i == kw else 1) for i, t in enumerate(toks)]
         space = pil.getlength(" ")
         text_w = sum(widths) + space * (len(toks) - 1)
         lines = max(1, -(-int(text_w * 1.05) // (width - ml - mr)))
@@ -319,12 +396,51 @@ def emoji_overlays(words, st, width, height, face_at=None):
     return res
 
 
-def build_ass(words, st, width, height, titles=(), face_at=None):
-    st = {**DEFAULT_ST, **(st or {})}
+def clean_style(st):
+    """Profil tel que Claude l'a rempli → valeurs utilisables : null = défaut, nombres écrits en texte convertis."""
+    st = {**DEFAULT_ST, **{k: v for k, v in (st or {}).items() if v is not None}}
+    for k in ("epaisseur_contour", "ombre", "taille_pct_hauteur", "position_y_pct", "ombre_flou", "interlettrage_pct",
+              "max_caracteres"):
+        if k in st and not isinstance(st[k], (int, float)):
+            try:
+                st[k] = float(str(st[k]).replace(",", ".").split()[0])
+            except (ValueError, IndexError):  # « douce », « oui »… : description, pas une mesure
+                st.pop(k) if k not in DEFAULT_ST else st.update({k: DEFAULT_ST[k]})
+    return st
+
+
+LUMA_CLAIRE = 0.6  # luma moyenne derrière un bloc au-delà de laquelle le blanc se lit mal
+
+
+def mi(w):
+    return (w["start"] + w["end"]) / 2
+
+
+def build_ass(words, st, width, height, titles=(), face_at=None, caches=(), luma_at=None):
+    """`caches` = intervalles (début, fin) d'inserts à texte : aucun sous-titre n'y déborde (le bloc commencé
+    avant s'arrête à l'entrée de l'insert ; celui dont le mot finit après n'apparaît qu'à sa sortie).
+    `luma_at(a, b, haut, bas)` → luma 0-1 de l'image derrière le bloc (parts de la hauteur) : sur image claire,
+    l'ombre douce (`ombre_flou`) du bloc est renforcée."""
+    st = clean_style(st)
     blocks, size, ml, mr = layout(words, st, width, height, face_at)
+    for a, z in caches:
+        # un bloc dont le 1er mot finit surtout après l'insert reste (« dans » dit pendant le fondu de sortie)
+        blocks = [b for b in blocks if not (a - 0.02 <= b["start"] and mi(b["words"][0]) < z)]
+        for b in blocks:
+            if b["start"] < a < b["end"]:
+                b["end"] = a
+                b["words"] = [w for w in b["words"] if w["start"] < a]  # mot par mot / karaoké : rien après
+            elif a - 0.02 <= b["start"] < z:  # mot gardé mais insert encore à l'écran (fondu compris) : après lui
+                b["start"] = z
     font, gras = font_name(st)
+    ls = metrics(st, height)[4]
     bold = -1 if gras else 0
     outline = st["epaisseur_contour"] * height / 1920
+    flou = float(st.get("ombre_flou") or 0) * height / 1920  # ombre douce : calque 0 flouté, pas l'ombre ASS dure
+    shadow = 0 if flou else st.get("ombre", st["epaisseur_contour"] / 2) * height / 1920
+    for blk in blocks if flou and luma_at else ():
+        blk["clair"] = (luma_at(blk["start"], blk["end"], (blk["y"] - blk["hh"]) / height,
+                                (blk["y"] + blk["hh"]) / height) or 0) > LUMA_CLAIRE
     head = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -334,7 +450,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Mots,{font},{size},{ass_color(st['couleur'])},{ass_color(st['couleur_mot_actif'])},{ass_color(st['contour'])},&H80000000,{bold},0,0,0,100,100,0,0,1,{outline:.1f},{outline / 2:.1f},5,{ml},{mr},0,1
+Style: Mots,{font},{size},{ass_color(st['couleur'])},{ass_color(st['couleur_mot_actif'])},{ass_color(st['contour'])},&H80000000,{bold},0,0,0,100,100,{ls:.1f},0,1,{outline:.1f},{shadow:.1f},5,{ml},{mr},0,1
 Style: Boite,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 Style: Titre,{font},{round(size * 1.35)},{ass_color(st['couleur'])},{ass_color(st['couleur_mot_actif'])},{ass_color(st['contour'])},&H80000000,{bold},0,0,0,100,100,0,0,1,{outline * 1.3:.1f},{outline / 2:.1f},5,{width // 14},{width // 14},0,1
 
@@ -348,9 +464,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     full = "\\fscx100\\fscy100"
     lines = []
 
-    def ev(a, b, style, text):
+    def ev(a, b, style, text, clair=False):
         if b > a:
             lines.append(f"Dialogue: 1,{ass_time(a)},{ass_time(b)},{style},,0,0,0,,{text}")  # calque 0 = boîtes
+            if flou:  # même texte en noir translucide, flouté, un peu plus bas, sous le texte net
+                al, fl = ("20", flou * 1.5) if clair else ("50", flou)  # image claire : ombre plus dense et plus large
+                lines.append(f"Dialogue: 0,{ass_time(a)},{ass_time(b)},{style},,0,0,0,,"
+                             f"{{\\bord0\\shad0\\1c&H000000&\\1a&H{al}&\\blur{fl:.1f}}}{ombre_douce(text)}")
+
+    def ombre_douce(text):
+        """Copie pour l'ombre : sans couleurs ni flou d'entrée (elle reste floue), décalée de 30 % du flou vers le bas."""
+        dy = round(0.3 * flou)
+        sh = re.sub(r"\\1?c&H[0-9A-Fa-f]+&|\\blur[\d.]+", "", text)
+        return re.sub(r"\\(pos|move)\((\d+),(\d+)(?:,(\d+),(\d+))?",
+                      lambda m: f"\\{m[1]}({m[2]},{int(m[3]) + dy}" + (f",{m[4]},{int(m[5]) + dy}" if m[4] else ""), sh)
 
     def scale_tags(scale, start_pct):
         s0 = round(scale * start_pct / 100)
@@ -383,6 +510,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             return f"\\move({x},{y + round(0.02 * height)},{x},{y},0,{ENTREE_MS})\\fad({ENTREE_MS},0)"
         if anim == "fondu":
             return f"\\pos({x},{y})\\fad({ENTREE_MS},0)"
+        if anim == "flou":  # flou → net avec micro-zoom
+            return f"\\pos({x},{y})\\blur6\\fscx105\\fscy105\\t(0,{ENTREE_MS},\\blur0\\fscx100\\fscy100)"
         if anim == "rebond":
             return (f"\\pos({x},{y})\\fscx70\\fscy70\\t(0,90,\\fscx112\\fscy112)"
                     f"\\t(90,{ENTREE_MS + 50},\\fscx100\\fscy100)")
@@ -414,19 +543,38 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 a = blk["start"] if i == 0 else w["start"]
                 b = ws[i + 1]["start"] if i + 1 < len(ws) else blk["end"]
                 if anim == "mot_par_mot":
-                    ev(a, b, "Mots", line(blk, None, 80 if i == 0 else 100, 100, cache_apres=i))
+                    ev(a, b, "Mots", line(blk, None, 80 if i == 0 else 100, 100, cache_apres=i), blk.get("clair"))
                 else:
                     if box:
                         boite(blk, i, a, b)
                     # pas de pop avec la boîte : elle est dessinée à 100 % et décrocherait du texte pendant 100 ms
                     ev(a, b, "Mots", line(blk, i, 80 if i == 0 and not box else 100, 88 if not box else 100,
-                                          actif=not box))
+                                          actif=not box), blk.get("clair"))
         else:
             ev(blk["start"], blk["end"], "Mots",
-               line(blk, None, 80 if anim == "pop" else 100, 100, entree=entree(blk, anim)))
+               line(blk, None, 80 if anim == "pop" else 100, 100, entree=entree(blk, anim)), blk.get("clair"))
     for t in titles:
         txt = esc(t["text"].upper() if st["majuscules"] else t["text"])
-        ev(t["at"], t["at"] + t["duration"], "Titre", f"{{\\pos({width // 2},{round(0.2 * height)}){pop}}}{txt}")
+        a_, b_ = t["at"], t["at"] + t["duration"]
+        if t.get("fond"):  # carton plein écran (question de l'interview…) : fond uni, texte centré
+            fond = ass_color(t["fond"])[4:]
+            # calque 5 : par-dessus les sous-titres (le carton les cache)
+            lines.append(f"Dialogue: 5,{ass_time(a_)},{ass_time(b_)},Boite,,0,0,0,,{{\\an7\\pos(0,0)\\p1\\bord0\\shad0"
+                         f"\\1c&H{fond}&}}m 0 0 l {width} 0 {width} {height} 0 {height}{{\\p0}}")
+            y = height // 2
+        else:
+            # demi-hauteur du bloc titre (lignes estimées) : le titre entier reste dans le cadre
+            fs = round(size * 1.35)
+            plain = re.sub(r"[*{}]", "", t["text"])
+            half = math.ceil(len(plain) * 0.62 * fs / (width * 12 / 14)) * fs * 1.2 / 2
+            y = round(max(0.2 * height, 0.05 * height + half))
+            f = face_at(a_, b_) if face_at else None
+            if f and f[0] - half - 0.02 * height < y < f[1] + half + 0.02 * height:  # jamais sur le visage
+                au_dessus = f[0] - 0.03 * height - half
+                y = round(au_dessus) if au_dessus - half >= 0.05 * height else round(f[1] + 0.04 * height + half)
+        mot = ass_color(t.get("couleur_mot") or st.get("couleur_mot_cle") or DEFAULT_ST["couleur_mot_cle"])[4:]
+        txt = re.sub(r"\*(.+?)\*", lambda m: f"{{\\1c&H{mot}&\\fscx125\\fscy125}}{m.group(1)}{{\\r}}", txt)
+        lines.append(f"Dialogue: 6,{ass_time(a_)},{ass_time(b_)},Titre,,0,0,0,,{{\\pos({width // 2},{y}){pop}}}{txt}")
     return head + "\n".join(lines) + "\n"
 
 

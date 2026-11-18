@@ -7,6 +7,7 @@ Usage : python doctor.py [--dossier .] [--installer] [--sans-modele] [--modele p
 import argparse
 import importlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -22,6 +23,8 @@ import common  # noqa: E402
 PAQUETS = {"faster_whisper": "faster-whisper", "numpy": "numpy", "PIL": "Pillow", "cv2": "opencv-python-headless",
            "onnx_asr": "onnx-asr[cpu,hub]", "onnxruntime": "onnxruntime", "huggingface_hub": "huggingface_hub"}
 DOSSIERS = ["mes-videos", "rushs", "broll", "musique", "sorties"]
+# ses propres noms (A-Roll, B-Roll, Musique…) comptent pour les nôtres, comme illustrer.py
+ALIAS = {"rushs": common.RUSHS, "broll": common.BROLL, "musique": common.MUSIQUE}
 PARAKEET = "parakeet-tdt-0.6b-v3"  # = transcribe.PARAKEET (pas importé ici : transcribe a besoin de numpy)
 MODELE = PARAKEET
 REPLI = "large-v3-turbo"
@@ -34,6 +37,7 @@ YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/face_detectio
 WINGET = ["winget", "install", "--id", "Gyan.FFmpeg", "-e", "--silent",
           "--accept-source-agreements", "--accept-package-agreements"]
 EXE = ".exe" if os.name == "nt" else ""
+CLES_ILLUSTRER = Path.home() / ".monteur" / "cles.json"  # = illustrer.CLES
 
 
 def check_python():
@@ -161,16 +165,51 @@ def telecharger_visage():
         return False, str(e)
 
 
+def check_animations(installer_ok):
+    """Playwright + un navigateur (Edge/Chrome déjà là, sinon Chromium de Playwright, ~150 Mo)."""
+    if importlib.util.find_spec("playwright") is None:
+        if not (installer_ok and installer(["playwright"])):
+            return False, "Playwright absent -> relancer avec --installer (sinon cartes fixes)"
+    code = ("from playwright.sync_api import sync_playwright as s\n"
+            "with s() as p:\n"
+            "    for c in ('msedge','chrome',None):\n"
+            "        try:\n"
+            "            (p.chromium.launch(channel=c) if c else p.chromium.launch()).close(); print(c or 'chromium'); break\n"
+            "        except Exception: pass\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    nav = (r.stdout or "").strip()
+    if not nav and installer_ok:
+        _quiet([sys.executable, "-m", "playwright", "install", "chromium"])
+        nav = (subprocess.run([sys.executable, "-c", code], capture_output=True, text=True).stdout or "").strip()
+    return (True, f"prêtes ({nav})") if nav else (False, "aucun navigateur -> relancer avec --installer")
+
+
+def etat_illustrations():
+    """Illustrations libres (illustrer.py) : sans clé Wikimedia, NASA, Openverse ; une clé ajoute Pexels/Pixabay.
+    Lu ici sans importer illustrer (il a besoin de Pillow, peut-être pas encore installé)."""
+    try:
+        d = json.loads(CLES_ILLUSTRER.read_text(encoding="utf-8")) if CLES_ILLUSTRER.is_file() else {}
+    except (OSError, ValueError):
+        d = {}
+    avec = [n.capitalize() for n in ("pexels", "pixabay") if d.get(n) or os.environ.get(f"{n.upper()}_API_KEY")]
+    return "illustrations libres : Wikimedia, NASA, Openverse (sans clé)" + (
+        f" + {', '.join(avec)}" if avec else
+        " ; vidéos verticales en plus avec une clé gratuite (illustrer.py cle pexels <clé>, pexels.com/api)")
+
+
 def preparer_dossiers(racine):
-    """Crée les dossiers manquants ; renvoie (créés, {dossier: nombre de fichiers})."""
+    """Crée les dossiers manquants ; renvoie (créés, {dossier: (son vrai nom, nombre de fichiers)})."""
     racine = Path(racine)
     crees, contenu = [], {}
+    # il a déjà ses propres dossiers (A-Roll, B-Roll, Export…) : on n'en ajoute pas d'autres, vides
+    siens = racine.is_dir() and any(f.is_dir() and not f.name.startswith(".") and f.name not in DOSSIERS + ["ma-da"]
+                                    for f in racine.iterdir())
     for d in DOSSIERS:
-        p = racine / d
-        if not p.exists():
+        p = common.dossier(racine, ALIAS.get(d, (d,)))
+        if not p.exists() and not siens:
             p.mkdir(parents=True)
             crees.append(d)
-        contenu[d] = sum(1 for f in p.iterdir() if f.is_file() and not f.name.startswith("."))
+        contenu[d] = p.name, sum(1 for f in p.iterdir() if f.is_file() and not f.name.startswith(".")) if p.is_dir() else 0
     return crees, contenu
 
 
@@ -269,12 +308,23 @@ def main(argv=None):
         ok = False
         ligne(False, f"fichier du débruitage absent ({RNNN}) : réinstalle le module monteur (/plugin)")
 
+    # animations (anim.py) : facultatives — sans elles, cartes fixes (carte.py) ; donc pas bloquant pour `ok`
+    bon, info = check_animations(a.installer)
+    ligne(bon, f"animations (cartons, citations, logos animés) : {info}")
+
+    ligne(True, etat_illustrations())  # facultatives : jamais bloquant
+
+    r = common.ram_libre_go()
+    if r is not None:
+        ligne(True, f"mémoire libre : {r:.1f} Go" + (" → mode économe (un calcul à la fois, montage plus lent ; "
+              "fermer des applications accélère)" if common.ECONOME else ""))
+
     crees, contenu = preparer_dossiers(a.dossier)
     if crees:
         ligne(True, "dossiers créés : " + ", ".join(crees))
-    ligne(True, "dossiers : " + ", ".join(f"{d}/ ({n})" for d, n in contenu.items()))
-    if contenu["mes-videos"] and contenu["mes-videos"] < 5:
-        ligne(True, f"mes-videos/ : {contenu['mes-videos']} vidéo(s) ; 5 à 10 donnent une DA plus fidèle")
+    ligne(True, "dossiers : " + ", ".join(f"{nom}/ ({n})" for nom, n in contenu.values()))
+    if 0 < contenu["mes-videos"][1] < 5:
+        ligne(True, f"mes-videos/ : {contenu['mes-videos'][1]} vidéo(s) ; 5 à 10 donnent une DA plus fidèle")
 
     print("\n".join(["", "Vérification du monteur :", *lignes, ""]))
     print("Tout est prêt." if ok else "Pas encore prêt : corrige les lignes [!!] ci-dessus "

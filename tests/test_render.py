@@ -311,3 +311,78 @@ def test_bandes_noires_jamais_dans_le_cadre(tmp_path):
         seg = {"start": 0, "frames": 3, "zoom": z}
         crops, _, _ = render.plan(seg, info, 1080, 1920, 30, [(0, 0.5, 0.1, 0.2)] * 3, None, 1.0, 0.5, True)
         assert all(y >= info["bandes"][1] and y + ch <= 1080 + 0.5 for _, y, _, ch in crops), (z, crops[0])
+
+
+def test_transition_en_sortie_et_segment_muet(tmp_path):
+    import render
+    brolls = [{"at": 2.0, "frames": 45, "entree": "noir"}, {"at": 5.0, "frames": 30, "sortie": "flash",
+                                                            "sortie_couleur": "#F4A7B9"}]
+    trs = render.transitions_of({"transitions": [{"at": 1.0, "type": "flash"}]}, brolls, 30)
+    assert trs == [{"at": 1.0, "type": "flash"}, {"at": 2.0, "type": "noir"},
+                   {"at": 6.0, "type": "flash", "couleur": "#F4A7B9"}]  # sortie = at + durée à l'écran
+    # « muet » : même durée, piste son continue mais silencieuse
+    src = tmp_path / "r.mp4"
+    ff("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=2", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+       "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src))
+    out = tmp_path / "s.mkv"
+    render.render_segment({"start": 0.2, "frames": 30, "muet": True}, src, out, 180, 320, 30, [(0, 0, 135, 240)] * 30,
+                          "", True)
+    info = probe(out)
+    assert info["has_audio"] and abs(info["duration"] - 1.0) < 0.05
+    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", str(out), "-af", "volumedetect", "-f", "null", "-"],
+                       capture_output=True, text=True, encoding="utf-8").stderr
+    assert float(re.search(r"max_volume: (-?[\d.inf]+)", r).group(1)) < -60
+
+
+def test_transition_fuite_degrade_qui_monte():
+    """« fuite » : connue, posable en sortie de b-roll, dégradé d'opacité vertical (pas un aplat qui clignote)."""
+    import render
+    assert "fuite" in render.TRANSITIONS
+    trs = render.transitions_of({}, [{"at": 1.0, "frames": 30, "sortie": "fuite"}], 30)
+    assert trs == [{"at": 2.0, "type": "fuite"}]
+    f = render.transition_alpha("fuite", 0.3)
+    assert f.startswith("geq=") and "Y-H*" in f and "fade" not in f
+    assert "fade=t=in" in render.transition_alpha("flash", 0.24)
+
+
+def test_sous_titres_sur_inserts_et_broll_selon_le_profil():
+    import render
+    b = [{"at": 0, "frames": 30, "texte": True}, {"at": 2, "frames": 30, "texte": True, "sous_titres": True},
+         {"at": 4, "frames": 30}]
+    assert render.sans_sous_titres(b, {}, 30) == [(0, 1.0)]  # insert à texte masque, mosaïque et plan filmé gardent
+    assert render.sans_sous_titres(b, {"sur_broll": False}, 30) == [(0, 1.0), (4, 5.0)]
+
+
+def test_agrandissement_borne_et_fond_flou():
+    """Paysage 1080×1000 recadré en 9:16 = ×1,92 (net, accentué) : le zoom ajouté est borné à ×2 (sauf cadrage voulu) ; fond flou = plan
+    entier jamais agrandi au-delà d'AGRANDI_MAX."""
+    import reframe as rf
+    import render
+    assert rf.agrandissement(1080, 1000, 1080, 1920) == pytest.approx(1.92)
+    assert rf.agrandissement(3840, 2160, 1080, 1920, 1.1) < rf.AGRANDI_MAX  # 4K : de la marge pour zoomer
+    assert rf.zoom_borne(1080, 1000, 1080, 1920, 1.35) == pytest.approx(2.0 / 1.92)
+    assert rf.zoom_borne(1080, 1000, 1080, 1920, 1.35, voulu=True) == 1.35
+    assert rf.zoom_borne(3840, 2160, 1080, 1920, 1.5) == 1.5
+    assert rf.agrandissement(1080, 1000, 1080, 1920, fond_flou=True) == 1.0
+    assert rf.agrandissement(320, 180, 1080, 1920, fond_flou=True) == rf.AGRANDI_MAX
+    f = render.fond_flou_filtre((0, 0, 1080, 1000), 1080, 1920, "")
+    assert "crop=1080:1000:0:0,split" in f and "[ff]scale=1080:1000" in f and "gblur" in f and "overlay=(W-w)/2" in f
+
+
+def test_masque_delogo_dans_le_cadre():
+    import render
+    assert render.masque_filtre(None, 1080, 980) == ""
+    assert render.masque_filtre([0.5, 0.1, 0.2, 0.05], 1080, 980) == "delogo=x=540:y=98:w=216:h=49,"
+    # zone qui touche les bords (filigrane en bas à droite) : ramenée à 1 px, delogo la refuserait sinon
+    assert render.masque_filtre([0.8, 0.9, 0.2, 0.1], 1080, 980) == "delogo=x=864:y=882:w=215:h=97,"
+    ff("-f", "lavfi", "-i", "color=c=red:s=100x100:d=0.1", "-vf", render.masque_filtre([0, 0.5, 1, 0.5], 100, 100)
+       + "null", "-f", "null", "-")
+
+
+def test_luma_derriere_les_sous_titres(tmp_path):
+    import render
+    v = tmp_path / "v.mkv"
+    ff("-f", "lavfi", "-i", "color=c=black:s=108x192:d=1", "-vf", "drawbox=y=ih/2:w=iw:h=ih/2:c=white:t=fill",
+       "-pix_fmt", "yuv420p", str(v))
+    assert render.luma_zone(v, 0.5, 0.0, 0.4) < 0.1 and render.luma_zone(v, 0.5, 0.6, 0.9) > 0.9
+    assert render.luma_zone(tmp_path / "absent.mkv", 0, 0, 1) is None

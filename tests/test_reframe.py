@@ -103,17 +103,18 @@ def test_couleur_mesure_et_correction(tmp_path):
     ff("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=2", "-vf", "eq=saturation=0.6:brightness=-0.08",
        "-pix_fmt", "yuv420p", str(src))
     m = rf.measure_colour(src)
-    assert set(m) == {"luma", "contraste", "saturation", "temperature"}
-    target = {"luma": m["luma"] + 0.06, "contraste": m["contraste"], "saturation": m["saturation"] * 1.25,
+    assert set(m) == {"luma", "contraste", "saturation", "temperature", "p1", "p99", "hdr"} and not m["hdr"]
+    target = {"luma": m["luma"] + 0.05, "contraste": m["contraste"], "saturation": m["saturation"] * 1.1,
               "temperature": m["temperature"] + 0.03}
     vf = rf.colour_filter(m, target)
-    assert "eq=" in vf and "colorchannelmixer" in vf
+    assert "eq=" in vf and "colorchannelmixer" in vf and "brightness" not in vf
     fixed = tmp_path / "corrige.mp4"
     ff("-i", str(src), "-vf", vf, "-pix_fmt", "yuv420p", str(fixed))
     m2 = rf.measure_colour(fixed)
     for k in ("luma", "saturation", "temperature"):
-        assert abs(m2[k] - target[k]) < abs(m[k] - target[k]) * 0.5, (k, m, m2, target)
-    assert rf.colour_filter(m, m) == ""  # déjà conforme : rien
+        assert abs(m2[k] - target[k]) < abs(m[k] - target[k]) * 0.6, (k, m, m2, target)
+    pleins = dict(m, p1=0.02, p99=0.97)
+    assert rf.colour_filter(pleins, pleins) == ""  # déjà conforme, blancs pleins : rien
 
 
 def test_couleur_sans_piste_video(tmp_path):
@@ -136,3 +137,28 @@ def test_cadrage_de_la_da_zoom_de_base():
     assert rf.base_zoom(track, 1920, 1080, 1080, 1920, None) == 1.0
     x, y, cw2, ch2 = rf.crop_box(1920, 1080, 1080, 1920, 1.5, (0.5, 0.5), face=True, face_y=0.45)
     assert abs((0.5 * 1080 - y) / ch2 - 0.45) < 0.01  # visage placé à la hauteur de la DA
+
+
+def test_couleur_blancs_pleins_et_bornes():
+    """Blancs tassés (p99 0,9) : niveaux étirés ≤ ×1,12, blancs vers 0,97 sans jamais les baisser ; température ±0,10
+    sur source HDR (±0,06 sinon) ; une baisse de saturation reste un eq, une hausse passe par la vibrance (≤ 0,35)."""
+    m = {"luma": 0.45, "contraste": 0.2, "saturation": 0.2, "temperature": 0.05, "p1": 0.08, "p99": 0.9, "hdr": True}
+    vf, apres = rf.colour_plan(m, {"luma": 0.45, "contraste": 0.2, "saturation": 0.4, "temperature": 0.3})
+    lv = dict(kv.split("=") for kv in vf.split(",")[0].removeprefix("colorlevels=").split(":"))
+    lo, hi = float(lv["rimin"]), float(lv["rimax"])
+    assert 1 / (hi - lo) <= 1.12 + 1e-3 and (0.9 - lo) / (hi - lo) >= 0.97 - 1e-3
+    assert "vibrance=intensity=0.350" in vf and "rr=1.1000" in vf
+    assert "rr=1.0600" in rf.colour_filter(dict(m, hdr=False, p99=0.98), {"temperature": 0.3})
+    ok = dict(m, p1=0.02, p99=0.98, hdr=False)
+    assert "colorlevels" not in rf.colour_filter(ok, {"luma": 0.45})  # blancs déjà pleins : rien
+    assert "saturation=0.800" in rf.colour_filter(ok, {"saturation": 0.1}) and "vibrance" not in rf.colour_filter(ok, {"saturation": 0.1})
+    assert apres["temperature"] > m["temperature"] and apres["saturation"] > m["saturation"]
+
+
+def test_plan_sombre_eclairci_sans_noirs_releves():
+    """Boîte de nuit (luma 0,1, p99 0,69) à caler sur un rush clair : pas d'imin négatif (noirs gris), pas de
+    contraste qui l'assombrirait, gamma qui éclaircit."""
+    m = {"luma": 0.1066, "contraste": 0.1223, "saturation": 0.24, "temperature": 0.24, "p1": 0.0, "p99": 0.694,
+         "hdr": False}
+    vf, apres = rf.colour_plan(m, {"luma": 0.6, "contraste": 0.305})
+    assert "rimin=0.0000" in vf and "contrast=1.000" in vf and "gamma=1.250" in vf and apres["luma"] > 0.15

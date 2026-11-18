@@ -1,0 +1,122 @@
+{
+  "rythme": {
+    "respiration_intra_s": 0.12,
+    "respiration_phrases_s": 0.25,
+    "coupe_avant_mot_s": 0.08,
+    "duree_moyenne_plan_s": 1.3,
+    "mediane_plan_s": 1.2,
+    "coupes_par_minute": 46,
+    "silence_max_s": 0.6,
+    "plans_quantiles": [
+      0.7,
+      0.9,
+      1.2,
+      1.6,
+      2.1
+    ],
+    "hook_plan_s": 1.5
+  },
+  "zooms": {
+    "par_minute": 3,
+    "intensite": 1.08,
+    "style": "doux",
+    "types": {
+      "doux": 0.8,
+      "cut": 0.2
+    },
+    "rampe_s": 0.8,
+    "sur_visage": true,
+    "une_coupe_sur": 8
+  },
+  "sous_titres": {
+    "actif": true,
+    "police": "Inter Tight",
+    "gras": true,
+    "taille_pct_hauteur": 0.026,
+    "couleur": "#FFFFFF",
+    "couleur_mot_actif": "#FFFFFF",
+    "contour": "#000000",
+    "epaisseur_contour": 0,
+    "position_y_pct": 0.68,
+    "mots_par_bloc": 3,
+    "majuscules": false,
+    "animation": "fondu",
+    "couleur_mot_cle": "#FFFFFF",
+    "mots_cles_par_bloc": 0,
+    "mots_cles_part_blocs": 0.0,
+    "emojis_par_minute": 0,
+    "zone_sure": true,
+    "graisse": 600,
+    "ombre": 0,
+    "ombre_flou": 9,
+    "interlettrage_pct": -1.5,
+    "max_caracteres": 22,
+    "sur_broll": true
+  },
+  "audio": {
+    "lufs_cible": -14.0,
+    "musique": false,
+    "musique_db_sous_voix": -26,
+    "musique_lufs": -40,
+    "sfx_par_minute": 0,
+    "sfx_types": [],
+    "sfx_carton": null,
+    "voix_nettoyee": true
+  },
+  "broll": {
+    "part_pct": 0.15,
+    "duree_moy_s": 2.0,
+    "jamais_sur_hook": true,
+    "source": "videos_du_createur",
+    "couvre": "phrase",
+    "usage": "ses plans à elle (lieu, gestes, objets dont elle parle) en plein écran, une phrase entière couverte"
+  },
+  "hook": {
+    "duree_s": 3,
+    "type": "résultat",
+    "texte_a_l_ecran": false,
+    "formule": "ouvre sur sa phrase la plus forte (résultat ou avis tranché), sans « bonjour »"
+  },
+  "version": 2,
+  "origine": "style de depart",
+  "style_depart": "interview-posee",
+  "references": [],
+  "format": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30
+  },
+  "references_atypiques": [],
+  "titres": {
+    "actif": false,
+    "style": "",
+    "quand": ""
+  },
+  "transitions": [],
+  "graphismes": [],
+  "a_completer_par_claude": [
+    "sous_titres.police",
+    "sous_titres.couleurs",
+    "sous_titres.mots_par_bloc",
+    "sous_titres.animation",
+    "sous_titres.emojis",
+    "zooms.style",
+    "hook",
+    "broll.usage",
+    "titres",
+    "transitions",
+    "style_verbal"
+  ],
+  "cadrage": {
+    "visage_largeur": 0.3,
+    "visage_y": 0.32
+  },
+  "style_verbal": {
+    "duree_typique_s": 45,
+    "formules_hook": [],
+    "structure": "phrase forte → contexte → 2-3 idées → chute",
+    "cta": [],
+    "fin": "chute",
+    "registre": "tu"
+  }
+}

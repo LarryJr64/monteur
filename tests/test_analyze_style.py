@@ -107,3 +107,78 @@ def test_reference_atypique_et_profil_v1():
     assert merged["version"] == 2 and merged["sous_titres"]["police"] == "Anton"
     assert merged["zooms"]["style"] == "doux" and merged["rythme"]["duree_moyenne_plan_s"] == p["rythme"]["duree_moyenne_plan_s"]
     assert "sous_titres.emojis" in merged["a_completer_par_claude"] and "respiration_intra_s" in merged["rythme"]
+
+
+def test_da_neutre_sans_reference(tmp_path):
+    import analyze_style as an
+    import check
+    an.main(["--neutre", "--out", str(tmp_path / "ma-da")])
+    prof = json.loads((tmp_path / "ma-da/profile.json").read_text(encoding="utf-8"))
+    assert prof["neutre"] and prof["format"]["height"] == 1920
+    m = {"duree_moyenne_plan_s": 2.4, "duree": 40, "plans": [[0, 40]], "silence_max_s": 0.4, "silences": [],
+         "lufs": -14, "format": {}, "zooms_par_minute": 8, "sous_titres_presence": 1}
+    check.compare(m, prof)  # le contrôle tourne sur la DA neutre
+
+
+def test_debit_et_voix_sous_carton_dans_le_profil():
+    mes = {f"v{i}.mp4": dict(_fake(2.0), debit_mots_s=3.6 + 0.1 * i, voix_sous_carton=i == 0) for i in range(3)}
+    p = analyze_style.build_profile(mes)
+    assert p["rythme"]["debit_mots_s"] == 3.7 and p["hook"]["voix_sous_carton"] is False  # 2 cartons muets sur 3
+
+
+def test_son_diffusion_carton_et_musique_absente():
+    carton = {"impact": True, "intervalle_s": 0.267, "riser": True}
+    mes = {f"v{i}.mp4": dict(_fake(2.0, lufs=-15.5), sfx_par_minute=5.0, sfx_carton=carton if i == 1 else None)
+           for i in range(3)}
+    p = analyze_style.build_profile(mes)
+    a = p["audio"]
+    assert a["lufs_cible"] == -14 and a["lufs_reference"] == -15.5  # diffusion -14, mesure du pro pour information
+    assert a["sfx_carton"] == carton and a["sfx_par_minute"] == 5.0 and a["musique_db_sous_voix"] is None
+    # ancien profil : -15,5 copié de la référence et -18 de musique alors que la DA n'en a pas → remis d'aplomb
+    old = copy.deepcopy(p)
+    old["audio"].update(lufs_cible=-15.5, musique_db_sous_voix=-18)
+    merged = analyze_style.merge_existing(p, old)
+    assert merged["audio"]["lufs_cible"] == -14 and merged["audio"]["musique_db_sous_voix"] is None
+    old["verrous"] = ["audio.lufs_cible"]
+    assert analyze_style.merge_existing(p, old)["audio"]["lufs_cible"] == -15.5  # réglage de l'utilisateur gardé
+
+
+def test_ponderation_sources_et_ajout(tmp_path, monkeypatch):
+    import datetime
+    today = datetime.date(2026, 11, 18)
+    ancien = {"video": "inspi/a.mp4", "type": "inspi", "date": "2025-01-01"}
+    assert analyze_style.poids(ancien, today) == 1
+    assert analyze_style.poids({"type": "inspi", "date": "2026-11-01"}, today) == 2
+    assert analyze_style.poids({"type": "mien", "date": "2026-11-01"}, today) == 4  # son reel validé, récent
+    assert analyze_style.poids({"type": "mien", "date": None}, today) == 2
+    assert analyze_style.type_source("Références/x.mp4") == "inspi" and analyze_style.type_source("mes-videos/x.mp4") == "mien"
+
+    # 2 inspis anciennes à 1,0 s, son reel récent à 2,0 s : médiane simple 1,0 ; pondérée (1, 1, 4) → 2,0
+    mes = {"inspi/a.mp4": _fake(1.0), "inspi/b.mp4": _fake(1.0), "sorties/mon-reel.mp4": _fake(2.0, zpm=12.0)}
+    sources = analyze_style.sources_de(mes, [dict(ancien), {"video": "inspi/b.mp4", "type": "inspi", "date": None},
+                                             {"video": "sorties/mon-reel.mp4", "type": "mien", "date": "2026-11-18"}], today)
+    assert [s["poids"] for s in sources] == [1, 1, 4]
+    assert analyze_style.build_profile(mes)["rythme"]["duree_moyenne_plan_s"] == 1.0
+    p = analyze_style.build_profile(mes, sources)
+    assert p["rythme"]["duree_moyenne_plan_s"] == 2.0 and p["zooms"]["par_minute"] == 12.0
+    assert p["references"] == list(mes) and p["sources"] == sources
+    assert p["dispersion"]["duree_moyenne_plan_s"]["mediane"] == 1.0  # plage de ses vidéos : sans pondération
+
+    # --ajoute : une vidéo de plus, verrous jamais touchés, sources gardées avec leur date
+    old = analyze_style.build_profile({k: mes[k] for k in ("inspi/a.mp4", "inspi/b.mp4")})
+    old["zooms"]["par_minute"] = 3.0
+    old["verrous"] = ["zooms.par_minute"]
+    (tmp_path / "ma-da").mkdir()
+    (tmp_path / "ma-da/profile.json").write_text(json.dumps(old), encoding="utf-8")
+    (tmp_path / "sorties").mkdir()
+    (tmp_path / "sorties/mon-reel.mp4").write_bytes(b"x")
+    monkeypatch.setattr(analyze_style.measure, "measure", lambda v, w=None: _fake(2.0, zpm=12.0))
+    monkeypatch.chdir(tmp_path)
+    analyze_style.main(["--ajoute", "sorties/mon-reel.mp4", "--sans-transcription"])
+    p2 = json.loads((tmp_path / "ma-da/profile.json").read_text(encoding="utf-8"))
+    assert set(p2["mesures_brutes"]) == set(mes) and p2["verrous"] == ["zooms.par_minute"]
+    assert p2["zooms"]["par_minute"] == 3.0  # verrouillé par elle : la nouvelle vidéo ne l'écrase pas
+    new = next(s for s in p2["sources"] if s["video"] == "sorties/mon-reel.mp4")
+    assert new["type"] == "mien" and new["ajoute"] and new["poids"] == 4
+    assert all(s["date"] is None for s in p2["sources"] if s["video"] != "sorties/mon-reel.mp4")  # profil d'avant : anciennes
+    assert p2["rythme"]["duree_moyenne_plan_s"] == 2.0  # son reel pèse 4 contre 1 + 1

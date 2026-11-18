@@ -1,5 +1,6 @@
 import json
 import sys
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -126,7 +127,7 @@ def test_bruitage_place_au_bon_moment(tmp_path):
     y = audio.load(tmp_path / "mix.wav")
     pause = np.abs(y[int(1.8 * SR):int(3.0 * SR)])
     onset = 1.8 + np.argmax(pause > pause.max() * 0.3) / SR
-    assert abs(onset - (2.5 - 4 / 30)) < 0.01, onset
+    assert abs(onset - (2.5 - 1 / 30 - audio.ancre(str(audio.SFX_DIR / "click.wav")))) < 0.01, onset
     assert r["sfx_manquants"] == ["inexistant"] and len(r["sfx_places"]) == 1
 
 
@@ -209,3 +210,82 @@ def test_rnnoise_derniere_trame_corrompue_jamais_muet(tmp_path, monkeypatch, poi
 def test_nettoyage_true_false(tmp_path):
     audio.save(tmp_path / "in.wav", fake_speech(4, talk=((0.3, 3.0),)))
     assert audio.prepare_voice(tmp_path / "in.wav", tmp_path / "o.wav", False)["mode"] == "aucun"
+
+
+def test_temps_forts_120_bpm(tmp_path):
+    """Clics à 120 BPM (un toutes les 0,5 s, premier à 0,25 s) : grille retrouvée à ±25 ms ; calage borné."""
+    sr = 11025
+    x = np.zeros(sr * 8, np.float32)
+    for k in range(16):
+        i = int((0.25 + 0.5 * k) * sr)
+        x[i:i + 200] = np.random.default_rng(k).uniform(-0.9, 0.9, 200)
+    f = tmp_path / "clics.wav"
+    with wave.open(str(f), "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(sr)
+        w.writeframes((x * 32767).astype(np.int16).tobytes())
+    t = audio.beats(f, 8)
+    assert len(t) >= 12 and all(abs((b - 0.25) / 0.5 - round((b - 0.25) / 0.5)) * 0.5 < 0.025 for b in t)
+    assert audio.cale_sur_temps(1.30, t) == pytest.approx(1.25, abs=0.03)  # 50 ms avant : calé
+    assert audio.cale_sur_temps(1.45, t) == 1.45  # temps fort à 1,25 trop loin (> 0,15 s), 1,75 en retard : inchangé
+
+
+def test_ancre_selon_le_type(tmp_path):
+    """Point fort : crête d'un whoosh, fin d'un riser, attaque d'un impact (aussi pour un son déposé)."""
+    t = np.arange(SR) / SR
+    bruit = np.random.default_rng(0).standard_normal(SR).astype(np.float32)
+    audio.save(tmp_path / "whoosh_perso.wav", bruit * np.exp(-((t - 0.6) / 0.08) ** 2) * 0.5)
+    audio.save(tmp_path / "riser.wav", bruit * t * 0.5)
+    audio.save(tmp_path / "impact.wav", np.r_[np.zeros(SR // 5), bruit[:SR // 2] * np.exp(-t[:SR // 2] / 0.1)] * 0.5)
+    assert abs(audio.ancre(str(tmp_path / "whoosh_perso.wav")) - 0.6) < 0.03
+    assert audio.ancre(str(tmp_path / "riser.wav")) == pytest.approx(1.0, abs=1e-3)
+    assert abs(audio.ancre(str(tmp_path / "impact.wav")) - 0.2) < 0.03
+    assert audio.depart(tmp_path / "riser.wav", 3.1, 30) == pytest.approx(3.1 - 1 / 30 - 1.0, abs=1e-3)  # finit sur la coupe
+
+
+def test_carton_sonorise_comme_appris():
+    appris = {"impact": True, "intervalle_s": 0.267, "premier_tic_s": 0.29, "tic": "whoosh", "riser": True,
+              "niveaux_db": {"impact": -8, "tic": -20}}
+    fx = audio.carton_sfx({"at": 0.0, "duration": 3.1}, appris, 30)
+    assert fx[0] == {"type": "impact", "at": 0.0, "volume_db": -8, "duree_s": 0.29, "carton": True}
+    tics = [x for x in fx if x["type"] not in ("impact", "riser")]
+    assert len(tics) == 11 and tics[0]["at"] == 0.29 and tics[-1]["at"] <= 3.1 - 0.13
+    assert {x["type"] for x in tics} == {"swoosh"}  # 0,25 s : le seul souffle qui tient dans 0,27 s
+    assert fx[-1]["type"] == "riser" and fx[-1]["at"] == 3.1 and fx[-1]["volume_db"] == audio.NIVEAUX_CARTON["riser"]
+    assert audio.carton_sfx({"at": 0, "duration": 3}, {"riser": True}, 30) == [
+        {"type": "riser", "at": 3.0, "volume_db": audio.NIVEAUX_CARTON["riser"], "carton": True}]
+
+
+def test_carton_appris_sur_une_reference(tmp_path):
+    """Référence synthétique : coup à 0, clics tous les 0,25 s, voix après 3 s → rôles, intervalle, niveaux."""
+    x = np.zeros(6 * SR, np.float32)
+    x[:int(0.2 * SR)] += audio.load(audio.SFX_DIR / "impact.wav")[:int(0.2 * SR)] * 0.9
+    clic = audio.load(audio.SFX_DIR / "click.wav") * 0.1
+    for k in range(10):
+        i = int((0.3 + 0.25 * k) * SR)
+        x[i:i + len(clic)] += clic
+    x[3 * SR:] += fake_speech(3, talk=((0.1, 2.9),))
+    audio.save(tmp_path / "ref.wav", x)
+    found = [{"t": 0.0, "type": "impact"}] + [{"t": round(0.3 + 0.25 * k, 3), "type": "click"} for k in range(10)]
+    c = audio.carton_appris(tmp_path / "ref.wav", found, 3.0)
+    assert c["impact"] and not c["riser"] and c["intervalle_s"] == 0.25 and c["premier_tic_s"] == 0.3
+    assert c["tic"] == "click" and c["niveaux_db"]["impact"] > c["niveaux_db"]["tic"] + 10
+    assert audio.carton_appris(tmp_path / "ref.wav", found[:1], 3.0) is None
+
+
+def test_musique_sans_niveau_appris_defaut_commun(tmp_path):
+    """DA sans musique (musique_db_sous_voix None, ancien musique_lufs par défaut) : MUSIQUE_DB_DEFAUT, pas -16."""
+    _, edl = mix_workdir(tmp_path)
+    prof = {"audio": {"lufs_cible": -14, "musique": False, "musique_db_sous_voix": None, "musique_lufs": -30}}
+    r = audio.finish_mix(tmp_path / "voix.wav", edl, prof, tmp_path, tmp_path / "mix.wav")
+    assert r["musique_db_sous_voix"] == audio.MUSIQUE_DB_DEFAUT == -22
+
+
+def test_bruitage_ecourte(tmp_path):
+    """duree_s : le son s'arrête (fondu court) au lieu de traîner sur les tics suivants."""
+    audio.save(tmp_path / "voix.wav", fake_speech(4, talk=((2.5, 3.8),)))
+    edl = {"format": {"fps": 30}, "music": None, "sfx": [{"type": "impact", "at": 0.5, "duree_s": 0.3, "volume_db": -8}]}
+    audio.finish_mix(tmp_path / "voix.wav", edl, {}, tmp_path, tmp_path / "mix.wav")
+    y = np.abs(audio.load(tmp_path / "mix.wav"))
+    debut = 0.5 - 1 / 30 - audio.ancre(str(audio.SFX_DIR / "impact.wav"))
+    assert y[int((debut + 0.05) * SR):int((debut + 0.2) * SR)].max() > 0.05
+    assert y[int((debut + 0.32) * SR):int(2.3 * SR)].max() < 1e-3  # plus rien après 0,3 s

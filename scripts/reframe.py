@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import ffmpeg, probe, tonemap  # noqa: E402
+from common import PARALLELE, ffmpeg, probe, tonemap  # noqa: E402
 
 MODEL_NAME = "face_detection_yunet_2023mar.onnx"
 # opencv_zoo, licence MIT (models/face_detection_yunet/LICENSE, Shiqi Yu) — vérifiée le 05/11/2026
@@ -226,6 +226,26 @@ def crop_box(W, H, w, h, z, center, face=False, face_y=None):
     return x, y, cw, ch
 
 
+AGRANDI_MAX = 2.0  # au-delà de 2× sa définition un plan filmé se voit flou même accentué (unsharp dès 1,4×) ; un
+# paysage 1080p plein cadre 9:16 (×1,78) reste net : c'est ce que font les pros
+
+
+def agrandissement(W, H, w, h, zoom=1.0, fond_flou=False):
+    """Agrandissement à l'écran d'un plan W×H posé dans w×h : recadrage « cover » × zoom ; `fond_flou` = plan
+    entier (réduit de `zoom`) ajusté dans le cadre, jamais agrandi au-delà d'AGRANDI_MAX."""
+    z = max(zoom or 1.0, 1.0)
+    if fond_flou:
+        return min(w * z / W, h * z / H, AGRANDI_MAX)
+    return max(w / W, h / H) * z
+
+
+def zoom_borne(W, H, w, h, zoom, voulu=False):
+    """Zoom d'un b-roll filmé ramené pour que recadrage × zoom ≤ AGRANDI_MAX quand c'est évitable (jamais sous 1).
+    `voulu` (zoom_center explicite : cacher un logo, choisir un détail) : gardé tel quel."""
+    zoom = zoom or 1.0
+    return zoom if voulu else min(zoom, max(1.0, AGRANDI_MAX / agrandissement(W, H, w, h)))
+
+
 def _ease_cubic(u):
     return 4 * u ** 3 if u < 0.5 else 1 - (-2 * u + 2) ** 3 / 2
 
@@ -324,7 +344,7 @@ def _frames_rgb(video, t0=None, t1=None, n=8):
                                "-vf", f"scale={w}:{h},{tonemap(info)}null", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"],
                               capture_output=True).stdout
 
-    with ThreadPoolExecutor(4) as pool:
+    with ThreadPoolExecutor(PARALLELE) as pool:
         frames = [d for d in pool.map(grab, times) if len(d) == w * h * 3]
     if not frames:
         return np.zeros((0, h, w, 3), np.float32)
@@ -361,25 +381,59 @@ def measure_colour(video, t0=None, t1=None, box=None, n=8):
     y = f[..., 0] * 0.2126 + f[..., 1] * 0.7152 + f[..., 2] * 0.0722
     return {"luma": round(float(y.mean()), 4), "contraste": round(float(y.std()), 4),
             "saturation": round(float((f.max(-1) - f.min(-1)).mean()), 4),
-            "temperature": round(float(f[..., 0].mean() - f[..., 2].mean()), 4)}
+            "temperature": round(float(f[..., 0].mean() - f[..., 2].mean()), 4),
+            "p1": round(float(np.percentile(y, 1)), 4), "p99": round(float(np.percentile(y, 99)), 4),
+            "hdr": bool(probe(video).get("hdr"))}
+
+
+def colour_plan(m, target):
+    """(filtres ffmpeg, stats prévues après correction) pour rapprocher `m` de `target` (profile.couleur), bornés.
+    1. niveaux : blancs/noirs pleins (HDR ramené en SDR, ou blancs sous 0,95) — étirement ≤ ×1,12 ;
+    2. gamma (pas brightness : un décalage plafonne les blancs) + contraste ; 3. vibrance (peau épargnée) ;
+    4. température (±0,10 sur une source HDR, délavée par le tonemap ; ±0,06 sinon)."""
+    clamp = lambda v, a, b: min(max(v, a), b)  # noqa: E731
+    m, parts = dict(m), []
+    p1, p99 = m.get("p1"), m.get("p99")
+    if p99 is not None and p1 is not None and (m.get("hdr") or p99 < 0.95):
+        g = clamp(0.94 / max(p99 - p1, 0.05), 1.0, 1.12)
+        if g > 1.01:
+            # étirement plafonné : l'écart se partage entre blancs et noirs, sans jamais baisser les blancs sous 0,97
+            lo = max(0.0, min((p99 - 0.97 / g + p1 - 0.03 / g) / 2, p99 - 0.97 / g))  # jamais de noirs relevés
+            parts.append("colorlevels=" + ":".join(f"{c}imin={lo:.4f}:{c}imax={lo + 1 / g:.4f}" for c in "rgb"))
+            m.update(luma=(m["luma"] - lo) * g, contraste=m["contraste"] * g, saturation=m["saturation"] * g,
+                     temperature=m["temperature"] * g)
+    # bornes basses : au-delà de ×1,1 un contre-jour brûle les blancs (vu sur iPhone)
+    # après l'étirement, jamais de contraste < 1 : il redescendrait les blancs qu'on vient de remonter
+    c = clamp(target.get("contraste", m["contraste"]) / max(m["contraste"], 0.02), 1.0 if parts else 0.85, 1.1)
+    want = clamp(target.get("luma", m["luma"]), 0.05, 0.95)
+    if ((m["luma"] - 0.5) * (c - 1)) * (want - m["luma"]) < 0:
+        c = 1.0  # le contraste (pivot 0,5) éloignerait de la cible : un plan sombre à éclaircir s'assombrirait
+    after_c = (m["luma"] - 0.5) * c + 0.5
+    gam = clamp(math.log(clamp(after_c, 0.02, 0.98)) / math.log(want), 0.8, 1.25)  # y' = y^(1/gamma)
+    s = clamp(target.get("saturation", m["saturation"]) / max(m["saturation"], 0.02), 0.8, 1.0)
+    if abs(c - 1) > 0.01 or abs(gam - 1) > 0.01 or abs(s - 1) > 0.01:
+        parts.append(f"eq=contrast={c:.3f}:gamma={gam:.3f}:saturation={s:.3f}")
+    m.update(luma=clamp(after_c, 0.02, 0.98) ** (1 / gam), contraste=m["contraste"] * c,
+             saturation=m["saturation"] * s, temperature=m["temperature"] * s)
+    # vibrance (×(1+k) mesuré sur un rush iPhone) plutôt que saturation : un eq ×1,12 vire le feuillage au vert acide
+    k = clamp(target.get("saturation", m["saturation"]) / max(m["saturation"], 0.02) - 1, 0.0, 0.35)
+    if k > 0.01:
+        parts.append(f"vibrance=intensity={k:.3f}")
+        m.update(saturation=m["saturation"] * (1 + k), temperature=m["temperature"] * (1 + k))
+    if "temperature" in target:
+        lim = 0.10 if m.get("hdr") else 0.06
+        t = clamp((target["temperature"] - m["temperature"]) / max(2 * m["luma"], 0.1), -lim, lim)
+        if abs(t) > 0.004:
+            parts.append(f"colorchannelmixer=rr={1 + t:.4f}:bb={1 - t:.4f}")
+            m["temperature"] += 2 * t * m["luma"]
+    return ",".join(parts), {k: round(v, 4) if isinstance(v, float) else v for k, v in m.items()}
 
 
 def colour_filter(m, target):
     """Filtre ffmpeg qui rapproche les stats `m` de `target` (profile.couleur), bornées pour rester discret."""
     if not m or not target:
         return ""
-    clamp = lambda v, a, b: min(max(v, a), b)  # noqa: E731
-    parts = []
-    if "temperature" in target:
-        k = clamp((target["temperature"] - m["temperature"]) / max(2 * m["luma"], 0.1), -0.06, 0.06)
-        if abs(k) > 0.004:
-            parts.append(f"colorchannelmixer=rr={1 + k:.4f}:bb={1 - k:.4f}")
-    c = clamp(target.get("contraste", m["contraste"]) / max(m["contraste"], 0.02), 0.85, 1.2)
-    b = clamp(target.get("luma", m["luma"]) - ((m["luma"] - 0.5) * c + 0.5), -0.08, 0.08)
-    s = clamp(target.get("saturation", m["saturation"]) / max(m["saturation"], 0.02), 0.8, 1.3)
-    if abs(c - 1) > 0.01 or abs(b) > 0.005 or abs(s - 1) > 0.01:
-        parts.append(f"eq=contrast={c:.3f}:brightness={b:.3f}:saturation={s:.3f}")
-    return ",".join(parts)
+    return colour_plan(m, target)[0]
 
 
 if __name__ == "__main__":

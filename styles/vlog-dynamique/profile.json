@@ -1,0 +1,124 @@
+{
+  "rythme": {
+    "respiration_intra_s": 0.06,
+    "respiration_phrases_s": 0.12,
+    "coupe_avant_mot_s": 0.05,
+    "duree_moyenne_plan_s": 0.7,
+    "mediane_plan_s": 0.65,
+    "coupes_par_minute": 86,
+    "silence_max_s": 0.35,
+    "plans_quantiles": [
+      0.35,
+      0.5,
+      0.65,
+      0.85,
+      1.1
+    ],
+    "hook_plan_s": 0.6
+  },
+  "zooms": {
+    "par_minute": 24,
+    "intensite": 1.2,
+    "style": "punch",
+    "types": {
+      "punch": 0.5,
+      "cut": 0.3,
+      "crash": 0.2
+    },
+    "rampe_s": 0.15,
+    "sur_visage": true,
+    "une_coupe_sur": 3
+  },
+  "sous_titres": {
+    "actif": true,
+    "police": "Montserrat",
+    "gras": true,
+    "taille_pct_hauteur": 0.045,
+    "couleur": "#FFFFFF",
+    "couleur_mot_actif": "#FFE600",
+    "contour": "#000000",
+    "epaisseur_contour": 8,
+    "position_y_pct": 0.66,
+    "mots_par_bloc": 1,
+    "majuscules": true,
+    "animation": "pop",
+    "couleur_mot_cle": "#FDE047",
+    "mots_cles_par_bloc": 1,
+    "mots_cles_part_blocs": 0.3,
+    "emojis_par_minute": 4,
+    "zone_sure": true,
+    "graisse": 800,
+    "emojis_style": "au-dessus du mot, sur les émotions et les objets"
+  },
+  "audio": {
+    "lufs_cible": -14.0,
+    "musique": true,
+    "musique_db_sous_voix": -18,
+    "musique_lufs": -32,
+    "sfx_par_minute": 10,
+    "sfx_types": [
+      "whoosh",
+      "pop"
+    ],
+    "sfx_carton": null,
+    "voix_nettoyee": true
+  },
+  "broll": {
+    "part_pct": 0.2,
+    "duree_moy_s": 0.8,
+    "jamais_sur_hook": true,
+    "source": "videos_du_createur",
+    "couvre": "mot",
+    "usage": "ses plans de la journée, très courts, posés sur le mot qu'ils montrent"
+  },
+  "hook": {
+    "duree_s": 2,
+    "type": "choc",
+    "texte_a_l_ecran": true,
+    "formule": "phrase choc ou moment le plus fort de la journée, titre court à l'écran"
+  },
+  "version": 2,
+  "origine": "style de depart",
+  "style_depart": "vlog-dynamique",
+  "references": [],
+  "format": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30
+  },
+  "references_atypiques": [],
+  "titres": {
+    "actif": true,
+    "style": "titre court en capitales en haut de l'image",
+    "quand": "accroche"
+  },
+  "transitions": [],
+  "graphismes": [],
+  "a_completer_par_claude": [
+    "sous_titres.police",
+    "sous_titres.couleurs",
+    "sous_titres.mots_par_bloc",
+    "sous_titres.animation",
+    "sous_titres.emojis",
+    "zooms.style",
+    "hook",
+    "broll.usage",
+    "titres",
+    "transitions",
+    "style_verbal"
+  ],
+  "cadrage": {
+    "visage_largeur": 0.34,
+    "visage_y": 0.33
+  },
+  "style_verbal": {
+    "duree_typique_s": 35,
+    "formules_hook": [],
+    "structure": "moment fort → la journée en accéléré → chute",
+    "cta": [
+      "Abonne-toi pour la suite"
+    ],
+    "fin": "cta",
+    "registre": "tu"
+  }
+}

@@ -141,6 +141,13 @@ def test_punch_in_cut_et_echelle(tmp_path):
     assert [round(c * FPS) for c in cuts] == [60, 120]
     z = measure.zooms(frames, [60, 120], FPS)
     assert len(z) == 1 and z[0]["type"] == "cut" and abs(z[0]["echelle"] - 1.2) <= 0.03
+    assert not measure.zoom_fin(frames, [60])  # le dernier plan est plus serré
+
+
+def test_zoom_fin_dernier_plan_plus_large(tmp_path):
+    v = make_video(tmp_path / "fin.mp4", [(0, 1.5, 1.2, 1.2), (1.5, 1.5, 1, 1)])
+    cuts, frames = _cut_times(v)
+    assert measure.zoom_fin(frames, [round(c * FPS) for c in cuts])
 
 
 def test_jump_cut_sans_zoom_pas_compte_comme_zoom(tmp_path):
@@ -255,3 +262,24 @@ def test_distribution_cadrage_noir():
     noir = np.zeros((4, 8, 8, 3), np.uint8)
     noir[2:] = 200
     assert measure.images_noires(noir) == 0.5
+
+
+def test_debit_et_voix_sous_carton():
+    W = lambda t, a, b, **k: {"w": t, "start": a, "end": b, **k}  # noqa: E731
+    ref = [W("[euh]", 0.03, 0.26, filler=True), W("Du", 2.97, 3.05), W("coup", 3.05, 3.21), W("dans", 3.23, 3.37),
+           W("15", 3.39, 3.69), W("ans.", 3.69, 3.83)]
+    assert measure.voix_sous_carton(ref, 3.103) is False  # carton muet : un « euh » et un mot à la coupe
+    assert measure.debit(ref) == round(5 / (3.83 - 2.97), 3)  # hésitations hors compte
+    assert measure.voix_sous_carton([W("Quel", 0.2, 0.5), W("est", 0.5, 0.7)], 3.1) is True
+    assert measure.debit(ref[:2]) is None
+
+
+def test_carton_fin():
+    """Carton muet = 1er plan ≥ 1 s sans parole avant sa fin (un « euh » transcrit sur le bruitage ne compte pas)."""
+    W = lambda t, a, b, **k: {"w": t, "start": a, "end": b, **k}  # noqa: E731
+    ref = [W("[euh]", 0.03, 0.26, filler=True), W("Du", 2.97, 3.05), W("coup", 3.05, 3.21)]
+    plans = [[0.0, 3.103], [3.103, 4.6]]
+    assert measure.carton_fin(ref, plans) == 3.103
+    assert measure.carton_fin([W("Quel", 0.2, 0.5)] + ref, plans) == 0.0  # on parle sous le 1er plan : pas un carton
+    assert measure.carton_fin(ref, [[0.0, 0.6], [0.6, 4.6]]) == 0.0  # plan trop court
+    assert measure.carton_fin(ref, [[0.0, 5.0]]) == 0.0  # un seul plan

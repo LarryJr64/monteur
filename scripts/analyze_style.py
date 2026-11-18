@@ -1,11 +1,15 @@
 """Apprend la DA mesurable depuis 5-10 vidéos déjà montées → ma-da/profile.json + images pour Claude.
 
 Usage : python scripts/analyze_style.py mes-videos/ [--out ma-da] [--force] [--sans-transcription] [--rapide]
+        python scripts/analyze_style.py --ajoute sorties/mon-reel.mp4 [--type mien|inspi]   (une vidéo de plus)
+Médianes pondérées (`sources` de profile.json) : ses reels validés comptent double face aux inspirations, et
+une source de moins de 90 jours double face aux plus anciennes. Les `verrous` ne sont jamais touchés.
 Les transcripts des références (respiration, hook, musique sous la voix) sont relus depuis .monteur/transcripts/ ;
 s'il en manque, transcribe.py est lancé (phrases dans .monteur/takes_references.md).
 """
 import argparse
 import copy
+import datetime
 import json
 import statistics
 import subprocess
@@ -16,7 +20,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 import measure
-from common import die, find_transcript, list_videos, probe, tonemap
+from common import LUFS_DIFFUSION, die, find_transcript, list_videos, probe, tonemap
 
 MAX_IMAGES = 40
 SHEET_MAX = 24
@@ -29,8 +33,8 @@ DEFAUTS = {
                     "epaisseur_contour": 6, "position_y_pct": 0.70, "mots_par_bloc": 3, "majuscules": True,
                     "animation": "pop", "couleur_mot_cle": "#FDE047", "mots_cles_par_bloc": 1,
                     "mots_cles_part_blocs": 0.3, "emojis_par_minute": 0, "zone_sure": True},
-    "audio": {"lufs_cible": -14.0, "musique": False, "musique_db_sous_voix": -18, "musique_lufs": -30,
-              "sfx_par_minute": 0, "sfx_types": [], "voix_nettoyee": True},
+    "audio": {"lufs_cible": LUFS_DIFFUSION, "musique": False, "musique_db_sous_voix": None, "musique_lufs": -30,
+              "sfx_par_minute": 0, "sfx_types": [], "sfx_carton": None, "voix_nettoyee": True},
     "couleur": None,
     "broll": {"part_pct": 0.15, "duree_moy_s": 1.8, "jamais_sur_hook": True},
     "hook": {"duree_s": 3},
@@ -48,6 +52,9 @@ DISPERSION = {"duree_moyenne_plan_s": "plan moyen (s)", "zooms_par_minute": "zoo
               "silence_max_s": "plus long silence (s)", "broll_part": "part de b-roll", "duree": "durée (s)",
               "sous_titres_presence": "sous-titres", "hook_plan_s": "plan de l'accroche (s)",
               "mediane_plan_s": "plan médian (s)", "coupes_par_minute": "coupes/min"}
+POIDS = {"mien": 2, "inspi": 1}  # ses reels validés comptent double face aux inspirations
+RECENT_JOURS = 90               # une source plus récente compte double face aux anciennes (sans date = ancienne)
+DOSSIERS_INSPI = {"inspi", "inspis", "inspiration", "inspirations", "références", "references", "refs", "ref"}
 STYLE_MD = """# Ma DA
 
 ## Observations
@@ -91,6 +98,33 @@ def _set(d, dotted, v):
             d[k] = {}
         d = d[k]
     d[keys[-1]] = v
+
+
+def type_source(video):
+    return "inspi" if Path(video).parent.name.lower() in DOSSIERS_INSPI else "mien"
+
+
+def poids(source, today):
+    d = source.get("date")
+    recent = bool(d) and (today - datetime.date.fromisoformat(d)).days <= RECENT_JOURS
+    return POIDS.get(source.get("type"), 1) * (2 if recent else 1)
+
+
+def sources_de(mes, anciennes, today, type_=None):
+    """Une source par vidéo mesurée {video, type, date, poids} ; date et type d'avant gardés."""
+    old = {s["video"]: s for s in anciennes or []}
+    out = []
+    for v in mes:
+        s = dict(old.get(v) or {"video": v, "type": type_ or type_source(v), "date": today.isoformat()})
+        s["poids"] = poids(s, today)
+        out.append(s)
+    return out
+
+
+def pondere(mes, sources):
+    """Chaque mesure répétée `poids` fois : médianes et comptes de measured_fields deviennent pondérés."""
+    w = {s["video"]: s.get("poids", 1) for s in sources or []}
+    return {f"{k}#{i}": m for k, m in mes.items() for i in range(max(1, w.get(k, 1)))}
 
 
 def export_frames(path, out, budget):
@@ -181,6 +215,9 @@ def measured_fields(mes):
     qs = [m["plans_quantiles"] for m in ms if m.get("plans_quantiles")]
     f["rythme.plans_quantiles"] = [round(statistics.median(c), 3) for c in zip(*qs)] if qs else None
     f["rythme.hook_plan_s"] = med(col("hook_plan_s"))
+    f["rythme.debit_mots_s"] = med(col("debit_mots_s"))
+    vs = [x for x in col("voix_sous_carton") if x is not None]
+    f["hook.voix_sous_carton"] = 2 * sum(vs) >= len(vs) if vs else None
     f["cadrage.visage_largeur"] = med(sub("cadrage", "visage_largeur"))
     f["cadrage.visage_y"] = med(sub("cadrage", "visage_y"))
 
@@ -191,6 +228,8 @@ def measured_fields(mes):
               "zooms.style": zst.most_common(1)[0][0] if zst else None,
               "zooms.types": {k: round(v / n_zooms, 2) for k, v in pool.most_common()} if n_zooms else None,
               "zooms.rampe_s": med(col("zoom_rampe_s")), "zooms.une_coupe_sur": med(col("zoom_une_coupe_sur"))})
+    fins = [m["zoom_fin"] for m in ms if m.get("zoom_fin") is not None]
+    f["zooms.fin"] = 2 * sum(fins) > len(fins) if fins else None
     vis = med(col("zoom_sur_visage"))
     f["zooms.sur_visage"] = None if vis is None else vis >= 0.6
 
@@ -220,7 +259,9 @@ def measured_fields(mes):
     noirs = [x for x in col("images_noires") if x is not None]
     f["images_noires_max"] = max(noirs) if noirs else None
     lufs = med(col("lufs"))
-    f["audio.lufs_cible"] = round(lufs, 1) if lufs is not None else None
+    # on diffuse à -14 LUFS (réseaux) quelle que soit la loudness du pro, gardée pour information
+    f["audio.lufs_cible"] = LUFS_DIFFUSION
+    f["audio.lufs_reference"] = round(lufs, 1) if lufs is not None else None
     # musique = fond continu (niveau) ET tonal (notes) : un bruit de pièce a le niveau mais pas les notes
     ton = med(col("musique_tonalite"))
     f["audio.musique"] = med(col("fond_sonore_db"), -180) > measure.FOND_MUSIQUE_DB and \
@@ -228,7 +269,9 @@ def measured_fields(mes):
     music = med(col("musique_lufs"))
     f["audio.musique_lufs"] = music if f["audio.musique"] else None
     f["audio.musique_db_sous_voix"] = round(music - lufs) if f["audio.musique"] and music is not None and lufs else None
-    f["audio.sfx_par_minute"] = med(col("sfx_par_minute"))
+    f["audio.sfx_par_minute"] = med(col("sfx_par_minute"))  # hors carton, hors parole : fiable
+    # shortcut: le carton de la 1re référence qui en a un ; une médiane par rôle si plusieurs DA de carton diffèrent
+    f["audio.sfx_carton"] = next((m["sfx_carton"] for m in ms if m.get("sfx_carton")), None)
     types = Counter(x["type"] for m in ms for x in m.get("sfx") or [])
     f["audio.sfx_types"] = [t for t, _ in types.most_common(4)] if types else None
 
@@ -275,14 +318,14 @@ def dispersion(mes):
     return disp, atyp
 
 
-def build_profile(mes):
+def build_profile(mes, sources=None):
     ms = list(mes.values())
     fmt = Counter(tuple(m["format"].values()) for m in ms).most_common(1)[0][0]
     p = copy.deepcopy(DEFAUTS)
     p.update({"version": 2, "references": list(mes), "format": dict(zip(("width", "height", "fps"), fmt))})
     p["rythme"].update({"duree_moyenne_plan_s": None, "mediane_plan_s": None, "coupes_par_minute": None,
                         "silence_max_s": None})
-    for k, v in measured_fields(mes).items():
+    for k, v in measured_fields(pondere(mes, sources)).items():
         if v is not None:
             _set(p, k, v)
     if p["couleur"] is None:
@@ -290,6 +333,8 @@ def build_profile(mes):
     disp, atyp = dispersion(mes)
     p.update({"dispersion": disp, "references_atypiques": atyp, "mesures_brutes": mes,
               "a_completer_par_claude": list(A_COMPLETER), "verrous": []})
+    if sources:
+        p["sources"] = sources
     return p
 
 
@@ -297,12 +342,17 @@ def merge_existing(new, old):
     """Relance : les champs mesurés sont remplacés, sauf ceux verrouillés (corrections de l'utilisateur,
     `verrous`) ou confirmés par Claude (entrée retirée de `a_completer_par_claude`). Tout le reste est gardé."""
     merged = copy.deepcopy(old)
-    for key in ("references", "format", "mesures_brutes", "dispersion", "references_atypiques"):
-        merged[key] = new[key]
+    for key in ("references", "format", "mesures_brutes", "dispersion", "references_atypiques", "sources"):
+        if key in new:
+            merged[key] = new[key]
     reste = old.get("a_completer_par_claude", [])
     verrous = set(old.get("verrous", []))
-    for k, v in measured_fields(new["mesures_brutes"]).items():
-        if v is None or k in verrous:
+    mf = measured_fields(pondere(new["mesures_brutes"], new.get("sources")))
+    for k, v in mf.items():
+        # DA sans musique : le niveau de musique d'avant (ancien défaut -18) ne vaut plus rien
+        if v is None and not (k == "audio.musique_db_sous_voix" and mf.get("audio.musique") is False):
+            continue
+        if k in verrous:
             continue
         if k in CONFIRME_PAR and CONFIRME_PAR[k] not in reste and _get(old, k) is not None:
             continue
@@ -323,9 +373,10 @@ def merge_existing(new, old):
 def transcripts(videos, root, rapide, takes):
     """Mots de chaque référence ; lance transcribe.py pour celles qui n'ont pas encore de transcript."""
     manquants = [v for v in videos if find_transcript(root, v.as_posix()) is None]
-    if manquants:
-        print(f"Transcription de {len(manquants)} référence(s) (≈1 min par minute de vidéo)...", flush=True)
-        cmd = [sys.executable, str(Path(__file__).with_name("transcribe.py")), *map(str, manquants),
+    if manquants or not Path(takes).exists():  # tout en cache : transcribe.py réécrit juste les phrases (rapide)
+        if manquants:
+            print(f"Transcription de {len(manquants)} référence(s) (≈1 min par minute de vidéo)...", flush=True)
+        cmd = [sys.executable, str(Path(__file__).with_name("transcribe.py")), *map(str, videos),
                "--takes", takes, "--root", str(root)] + (["--rapide"] if rapide else [])
         if subprocess.run(cmd).returncode != 0:
             print("Transcription impossible : respiration, hook et musique non mesurés (défauts gardés).")
@@ -362,16 +413,66 @@ def summary(p):
     return "\n".join(lignes)
 
 
+NEUTRE_MD = """# Ma DA (neutre : aucune vidéo de référence)
+
+## Règles de montage
+- Reel organique, sobre : plans de ~2 s, visage serré dans le haut du cadre, coupes sèches, pas de bruitage ni d'emoji.
+- Sous-titres blancs, 3 mots, un mot-clé jaune sur 3 blocs environ.
+- Zooms doux, 1 coupe sur 3. Musique seulement si un fichier est fourni, très bas.
+- Le message (ou la trame) peut changer tout cela : ses demandes priment.
+"""
+
+
+def neutre(out):
+    """Pas de référence : DA sobre de reel, pour que le montage et check.py marchent quand même."""
+    p = copy.deepcopy(DEFAUTS)
+    p.update(version=2, neutre=True, format={"width": 1080, "height": 1920, "fps": 30})
+    p["rythme"].update(duree_moyenne_plan_s=2.0, plans_quantiles=[1.1, 1.5, 2.0, 2.6, 3.4], hook_plan_s=1.5)
+    # visage serré et haut, sous-titres dessous : cadrage d'un reel interview monté par un pro (mesuré : 0,32 / 0,27)
+    p["cadrage"] = {"visage_largeur": 0.30, "visage_y": 0.32}
+    p["zooms"].update(par_minute=8, intensite=1.12, style="doux", types={"doux": 0.7, "punch": 0.3}, une_coupe_sur=3)
+    p["sous_titres"]["emojis_par_minute"] = 0
+    p["audio"].update(musique_db_sous_voix=-24)  # DA sans musique : fichier déposé = nappe discrète
+    p["broll"]["part_pct"] = 0.0
+    p["verrous"] = []
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "profile.json").write_text(json.dumps(p, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out / "STYLE.md").write_text(NEUTRE_MD, encoding="utf-8")
+    print(f"DA neutre écrite dans {out}/ (profile.json, STYLE.md) : reel sobre, à ajuster selon sa demande.")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Mesure la DA de vidéos déjà montées → profile.json + images.")
-    ap.add_argument("dossier", help="dossier des vidéos de référence (ex. mes-videos/)")
+    ap.add_argument("dossier", nargs="?", help="dossier des vidéos de référence (ex. mes-videos/)")
+    ap.add_argument("--neutre", action="store_true", help="aucune référence : écrit une DA de reel sobre")
     ap.add_argument("--out", default="ma-da", help="dossier de sortie (défaut ma-da)")
     ap.add_argument("--force", action="store_true", help="réécrire tout profile.json (perd les champs complétés)")
     ap.add_argument("--root", default=".", help="dossier de travail (contient .monteur/)")
     ap.add_argument("--sans-transcription", action="store_true",
                     help="ne pas transcrire les références (respiration/hook/musique : transcripts existants seulement)")
     ap.add_argument("--rapide", action="store_true", help="transcription rapide (modèle small)")
+    ap.add_argument("--ajoute", metavar="VIDEO", help="ajoute UNE vidéo (reel validé, inspi) au profil existant sans tout refaire")
+    ap.add_argument("--type", choices=("mien", "inspi"),
+                    help="ses vidéos (poids 2) ou inspiration (poids 1) ; défaut : mien, inspi si le dossier s'appelle inspi/Références")
     args = ap.parse_args(argv)
+    if args.neutre:
+        if (Path(args.out) / "profile.json").exists() and not args.force:
+            die(f"{args.out}/profile.json existe déjà (--force pour le remplacer par la DA neutre)")
+        return neutre(Path(args.out))
+    root = Path(args.root)
+    out = Path(args.out)
+    path = out / "profile.json"
+    old = None
+    if path.exists() and not args.force:
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            die(f"{path} illisible ({e}) : corrige-le ou relance avec --force")
+    today = datetime.date.today()
+    if args.ajoute:
+        return ajoute(Path(args.ajoute), old, path, root, args, today)
+    if not args.dossier:
+        die("indique le dossier des vidéos de référence, ou --neutre")
     folder = Path(args.dossier)
     if not folder.is_dir():
         die(f"dossier introuvable : {folder}")
@@ -380,8 +481,6 @@ def main(argv=None):
         die(f"aucune vidéo dans {folder} (formats : mp4, mov, mkv...)")
     if len(videos) < 5:
         print(f"Note : {len(videos)} vidéo(s) seulement ; 5 à 10 donnent une DA bien plus fiable.")
-    root = Path(args.root)
-    out = Path(args.out)
     frames_dir = out / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
@@ -398,13 +497,12 @@ def main(argv=None):
             n_img += export_bursts(v, frames_dir, words.get(v.as_posix()),
                                    mes[v.as_posix()].get("sous_titres_position_y_pct"))
 
-    profile = build_profile(mes)
-    path = out / "profile.json"
-    if path.exists() and not args.force:
-        try:
-            old = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            die(f"{path} illisible ({e}) : corrige-le ou relance avec --force")
+    anciennes = (old or {}).get("sources") or []
+    for s in anciennes:  # reels ajoutés un à un (--ajoute) : une relance sur le dossier ne les oublie pas
+        if s.get("ajoute") and s["video"] not in mes and s["video"] in (old.get("mesures_brutes") or {}):
+            mes[s["video"]] = old["mesures_brutes"][s["video"]]
+    profile = build_profile(mes, sources_de(mes, anciennes, today, args.type))
+    if old is not None:
         profile = merge_existing(profile, old)
         print("profile.json existant : champs complétés et verrouillés conservés (--force pour tout réécrire).")
     path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -419,6 +517,31 @@ def main(argv=None):
     print(f"{len(videos)} vidéo(s) mesurée(s), {n_img} images + planches (_sheet, _debut, _fin, _anim_entree, _anim_mots) dans {frames_dir}.")
     print(f"Profil : {path}. À compléter par Claude (en regardant les images) : "
           + (", ".join(profile["a_completer_par_claude"]) or "rien"))
+
+
+def ajoute(video, old, path, root, args, today):
+    """Une vidéo de plus dans le profil (médianes pondérées recalculées), sans re-mesurer les autres."""
+    if old is None:
+        die(f"{path} introuvable : apprends d'abord la DA (ou --neutre), puis ajoute des vidéos une à une")
+    if not video.is_file():
+        die(f"vidéo introuvable : {video}")
+    key = video.as_posix()
+    words = {} if args.sans_transcription else transcripts([video], root, args.rapide,
+                                                           str(root / ".monteur" / "takes_ajout.md"))
+    words = words.get(key) or (find_transcript(root, key) or {}).get("words")
+    print(f"Analyse de {video.name}...", flush=True)
+    mes = dict(old.get("mesures_brutes") or {})
+    mes[key] = measure.measure(video, words)
+    # profil d'avant les sources pondérées : ses références restent, sans date (comptent comme anciennes)
+    anciennes = [s for s in old.get("sources") or [{"video": v, "type": type_source(v), "date": None} for v in mes]
+                 if s["video"] != key]
+    anciennes.append({"video": key, "type": args.type or "mien", "date": today.isoformat(), "ajoute": True})
+    profile = merge_existing(build_profile(mes, sources_de(mes, anciennes, today)), old)
+    path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    src = next(s for s in profile["sources"] if s["video"] == key)
+    print(f"{video.name} ajoutée au profil ({src['type']}, poids {src['poids']} ; {len(mes)} vidéos en tout). "
+          f"Réglages verrouillés inchangés : {', '.join(profile.get('verrous') or []) or 'aucun'}.")
+    print(summary(profile))
 
 
 if __name__ == "__main__":

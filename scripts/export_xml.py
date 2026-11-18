@@ -3,7 +3,7 @@
 Les clips pointent vers les rushs ORIGINAUX : on peut tout retoucher dans le logiciel.
 Mêmes coupes que render.py : `.monteur/edl.rendu.json` (écrit par pacing/render) s'il est à jour, sinon
 pacing.normalize_edl, puis captions.snapped_segments : mêmes temps partout.
-Pistes son : 1 voix, 2 musique (bouclée, au volume de l'edl), 3 bruitages (assets/sfx, 4 images avant l'image visée).
+Pistes son : 1 voix, 2 musique (bouclée, au volume de l'edl), 3 bruitages (assets/sfx, point fort 1 image avant l'image visée).
 Zooms : images-clés d'échelle dans le FCPXML (doux/punch/crash) ; Premiere reçoit l'échelle finale (statique).
 shortcut: le recadrage sur le visage (suivi) n'est pas exporté, le cadre est centré ; à ajouter si demandé.
 """
@@ -15,7 +15,8 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import die, probe  # noqa: E402
+import audio  # noqa: E402
+from common import MUSIQUE_DB_DEFAUT, die, probe  # noqa: E402
 import captions  # noqa: E402
 import reframe as rf  # noqa: E402
 
@@ -72,7 +73,7 @@ def clips(edl, root, segs, fps, profile=None):
         if not src.exists():
             die(f"musique introuvable : {src}")
         n = max(1, round(probe(src)["duration"] * fps))
-        vol = music.get("volume_db", ((profile or {}).get("audio") or {}).get("musique_db_sous_voix", -18))
+        vol = music.get("volume_db", ((profile or {}).get("audio") or {}).get("musique_db_sous_voix") or MUSIQUE_DB_DEFAUT)
         for at in range(0, total, n):  # bouclée jusqu'à la fin, comme au rendu
             out.append({"src": src, "track": "musique", "at": at, "in": 0, "len": min(n, total - at), "gain_db": vol})
     for x in edl.get("sfx") or []:
@@ -80,7 +81,7 @@ def clips(edl, root, segs, fps, profile=None):
         if not src.exists():
             print(f"bruitage « {x.get('type')} » absent de assets/sfx : non exporté.")
             continue
-        at = max(0, round(float(x["at"]) * fps) - 4)  # le son part ~4 images avant l'image visée
+        at = max(0, round(audio.depart(src, float(x["at"]), fps) * fps))  # point fort 1 image avant l'image visée, comme au rendu
         n = min(max(1, round(probe(src)["duration"] * fps)), total - at)
         if n > 0:
             out.append({"src": src.resolve(), "track": "sfx", "at": at, "in": 0, "len": n,
@@ -281,8 +282,8 @@ def main():
             if "width" not in infos[c["src"]] and c["track"] in (1, 2):
                 die(f"pas de piste vidéo dans {c['src']}")
 
-    stem = Path(edl.get("output", "sorties/video.mp4")).stem
-    out = root / "sorties"
+    sortie = Path(edl.get("output", "sorties/video.mp4"))
+    stem, out = sortie.stem, root / sortie.parent  # à côté de la vidéo (Export/ si c'est là qu'il la veut)
     out.mkdir(parents=True, exist_ok=True)
     write_xml(fcpxml(items, infos, w, h, fps, stem), out / f"{stem}.fcpxml", "<!DOCTYPE fcpxml>\n")
     write_xml(xmeml(items, infos, w, h, fps, stem), out / f"{stem}.xml", "<!DOCTYPE xmeml>\n")

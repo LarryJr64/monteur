@@ -1,0 +1,152 @@
+{
+  "rythme": {
+    "respiration_intra_s": 0.07,
+    "respiration_phrases_s": 0.15,
+    "coupe_avant_mot_s": 0.05,
+    "duree_moyenne_plan_s": 0.8,
+    "mediane_plan_s": 0.75,
+    "coupes_par_minute": 75,
+    "silence_max_s": 0.3,
+    "plans_quantiles": [
+      0.4,
+      0.55,
+      0.75,
+      1.0,
+      1.4
+    ],
+    "hook_plan_s": 0.7
+  },
+  "zooms": {
+    "par_minute": 15,
+    "intensite": 1.18,
+    "style": "punch",
+    "types": {
+      "punch": 0.6,
+      "crash": 0.2,
+      "doux": 0.2
+    },
+    "rampe_s": 0.2,
+    "sur_visage": true,
+    "une_coupe_sur": 3
+  },
+  "sous_titres": {
+    "actif": true,
+    "police": "Montserrat",
+    "gras": true,
+    "taille_pct_hauteur": 0.04,
+    "couleur": "#FFFFFF",
+    "couleur_mot_actif": "#FF5A36",
+    "contour": "#000000",
+    "epaisseur_contour": 7,
+    "position_y_pct": 0.68,
+    "mots_par_bloc": 2,
+    "majuscules": true,
+    "animation": "rebond",
+    "couleur_mot_cle": "#FF5A36",
+    "mots_cles_par_bloc": 1,
+    "mots_cles_part_blocs": 0.35,
+    "emojis_par_minute": 2,
+    "zone_sure": true,
+    "graisse": 800,
+    "emojis_style": "sur le bénéfice ou le résultat"
+  },
+  "audio": {
+    "lufs_cible": -14.0,
+    "musique": true,
+    "musique_db_sous_voix": -15,
+    "musique_lufs": -29,
+    "sfx_par_minute": 8,
+    "sfx_types": [
+      "whoosh",
+      "pop",
+      "impact"
+    ],
+    "sfx_carton": null,
+    "voix_nettoyee": true
+  },
+  "broll": {
+    "part_pct": 0.4,
+    "duree_moy_s": 1.0,
+    "jamais_sur_hook": false,
+    "source": "videos_du_createur",
+    "couvre": "mot",
+    "usage": "le produit en gros plan, en main, en usage, le résultat avant/après"
+  },
+  "hook": {
+    "duree_s": 2,
+    "type": "choc",
+    "texte_a_l_ecran": true,
+    "formule": "le problème ou le résultat en une phrase dans les 2 premières secondes, produit visible tout de suite"
+  },
+  "version": 2,
+  "origine": "style de depart",
+  "style_depart": "pub-produit",
+  "references": [],
+  "format": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30
+  },
+  "references_atypiques": [],
+  "titres": {
+    "actif": true,
+    "style": "bénéfice en capitales en haut de l'image",
+    "quand": "accroche et bénéfices"
+  },
+  "transitions": [],
+  "graphismes": [
+    {
+      "type": "chiffre",
+      "quand": "un chiffre fort (prix, résultat, pourcentage)",
+      "duree_s": 1.8,
+      "detail": "gros chiffre qui compte, mot sous le chiffre",
+      "police": "Montserrat",
+      "graisse": 800,
+      "entree": "monte",
+      "duree_entree_s": 0.3,
+      "sortie": "flash:#FFFFFF",
+      "sous_titres": false
+    },
+    {
+      "type": "liste",
+      "quand": "les bénéfices en 3 points",
+      "duree_s": 2.4,
+      "detail": "3 lignes qui arrivent une à une sur le produit assombri",
+      "police": "Montserrat",
+      "graisse": 800,
+      "entree": "monte",
+      "duree_entree_s": 0.3,
+      "sombre_fond": 0.5,
+      "sortie": "coupe",
+      "sous_titres": false
+    }
+  ],
+  "a_completer_par_claude": [
+    "sous_titres.police",
+    "sous_titres.couleurs",
+    "sous_titres.mots_par_bloc",
+    "sous_titres.animation",
+    "sous_titres.emojis",
+    "zooms.style",
+    "hook",
+    "broll.usage",
+    "titres",
+    "transitions",
+    "style_verbal"
+  ],
+  "cadrage": {
+    "visage_largeur": 0.32,
+    "visage_y": 0.32
+  },
+  "style_verbal": {
+    "duree_typique_s": 25,
+    "formules_hook": [],
+    "structure": "problème ou résultat → le produit → 3 bénéfices → preuve → appel à l'action",
+    "cta": [
+      "Lien en bio",
+      "Commande maintenant"
+    ],
+    "fin": "cta",
+    "registre": "tu"
+  }
+}

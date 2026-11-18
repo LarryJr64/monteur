@@ -6,12 +6,15 @@ respiration de la sortie. Écrit .monteur/rapports/<stem>.json. Code de sortie 0
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 import measure
 from common import die, find_transcript, work_dir
 
 SEUIL_SOUS_TITRES = 0.3  # part d'images avec du texte pour dire « sous-titres présents »
+BORNE_ZOOM_S = 0.15  # changement d'échelle mesuré à ±0,15 s d'une entrée/sortie de b-roll ou d'un raccord : pas un zoom
+SANS_BRUITAGE = re.compile(r"\b(pas|aucun|jamais) de bruitage", re.I)
 
 
 def fr(x, n=2):
@@ -21,13 +24,25 @@ def fr(x, n=2):
 def output_words(edl, root):
     """Mots dans le temps de la sortie (depuis les transcripts des rushs) + mots coupés aux raccords."""
     words, coupes, t = [], [], 0.0
-    for seg in (edl or {}).get("segments", []):
+    segs = (edl or {}).get("segments", [])
+    for i, seg in enumerate(segs):
         a, b = float(seg["start"]), float(seg["end"])
-        tr = find_transcript(root, seg["source"])
+        # bords internes posés par pacing (vraie pause retirée, jump cut) : sur l'énergie, souvent dans un mot de
+        # Parakeet qui contient la pause ; le mot va au morceau de son milieu, comme captions
+        in_a = seg.get("piece", 0) > 0
+        in_b = i + 1 < len(segs) and segs[i + 1].get("piece", 0) > 0 and segs[i + 1].get("seg") == seg.get("seg")
+        tr = find_transcript(root, seg["source"]) if not seg.get("muet") else None  # muet : rien d'entendu
         for w in (tr or {}).get("words", []):
             if w["end"] <= a + 0.02 or w["start"] >= b - 0.02:
                 continue
-            if w["start"] < a - 0.03 or w["end"] > b + 0.03:
+            cut_a, cut_b = w["start"] < a - 0.03, w["end"] > b + 0.03
+            if cut_a and not in_a and (w["start"] + w["end"]) / 2 < a and w["end"] <= a + 0.10:
+                continue  # mot d'avant collé : pacing coupe au creux d'énergie, ≤ 0,1 s avant sa fin transcrite
+            if (cut_a and in_a) or (cut_b and in_b):
+                if not a <= (w["start"] + w["end"]) / 2 < b:
+                    continue
+                cut_a, cut_b = cut_a and not in_a, cut_b and not in_b
+            if cut_a or cut_b:
                 coupes.append({"mot": w["w"].strip(), "a_s": round(t + max(0.0, w["start"] - a), 2),
                                "source": seg["source"]})
                 continue
@@ -57,9 +72,90 @@ def edl_measures(edl, root, profile):
     minutes = max(total, 1e-6) / 60
     colles = [b.get("plan") for a, b in zip(br, br[1:]) if a.get("scene") and a.get("scene") == b.get("scene")]         if edl.get("mode") == "voix_off" else []
     return {"words": words, "mots_coupes": coupes, "hook_fin_s": round(h, 2), "plans_meme_scene": colles,
-            "broll_sur_hook": [b for b in br if b["at"] < h - 0.05],
-            "broll_part": round(sum(b["duration"] for b in br) / max(total, 1e-6), 3),
-            "sfx_par_minute": round(len(edl.get("sfx") or []) / minutes, 2)}
+            "broll_sur_hook": [b for b in br if b["at"] < h - 0.05 and not b.get("carton")],
+            "carton": any(b.get("carton") and b["at"] < 0.1 for b in br),
+            # carton d'ouverture hors compte : la mesure de la référence ne le compte pas en b-roll
+            "broll_part": round(sum(b["duration"] for b in br if not b.get("carton")) / max(total, 1e-6), 3),
+            # bruitages du carton (posés seuls, comme la référence) hors compte, comme à la mesure
+            "sfx_par_minute": round(sum(1 for x in edl.get("sfx") or [] if not x.get("carton")) / minutes, 2),
+            # zooms posés (un par segment zoomé, pas par morceau) : la mesure à l'image en rate quand le rush est déjà
+            # recadré serré et que la tête bouge à la coupe
+            "zooms_par_minute": round(sum(1 for i, sg in enumerate(edl["segments"]) if (sg.get("zoom") or 1) > 1.01
+                                          and sg.get("zoom_type") not in ("aucun", "raccord")
+                                          and (sg.get("piece", 0) == 0 or i == 0
+                                          or edl["segments"][i - 1].get("zoom") != sg.get("zoom"))) / minutes, 2)}
+
+
+def bornes_sans_zoom(edl):
+    """Instants (sortie) où l'échelle change sans être un zoom : entrées/sorties de b-roll et d'inserts, raccords
+    à échelle alternée posés par pacing (`zoom_type` « raccord » / retour « aucun »)."""
+    out, t, prev = [], 0.0, None
+    for sg in (edl or {}).get("segments") or []:
+        if prev is not None and sg.get("zoom_type") in ("raccord", "aucun") and                 (sg.get("zoom") or 1.0) != (prev.get("zoom") or 1.0):
+            out.append(t)
+        t += sg["end"] - sg["start"]
+        prev = sg
+    for b in (edl or {}).get("broll") or []:
+        out += [b["at"], b["at"] + b["duration"]]
+    return out
+
+
+def zooms_hors_bornes(m, edl):
+    """Retire des zooms mesurés ceux qui tombent sur une borne de bornes_sans_zoom ; recalcule zooms_par_minute."""
+    bornes = bornes_sans_zoom(edl)
+    if not bornes:
+        return
+    m["zooms"] = [z for z in m.get("zooms") or [] if all(abs(z["t"] - x) > BORNE_ZOOM_S for x in bornes)]
+    m["zooms_par_minute"] = round(len(m["zooms"]) / max(m["duree"], 1e-6) * 60, 2)
+
+
+def etalonnage(video, edl):
+    """Plans filmés en b-roll hors étalonnage dans la sortie : trop sombres (luma < 0,12) ou dont R−B s'écarte de plus
+    de 0,15 du rush face caméra (mesuré sur le plus long passage sans b-roll). Inserts graphiques et carton exclus."""
+    edl = edl or {}
+    br = [b for b in edl.get("broll") or [] if not b.get("texte") and not b.get("carton")]
+    if not br or edl.get("mode") == "voix_off" or not edl.get("segments"):
+        return []
+    import reframe as rf
+    total, t, trous = sum(s["end"] - s["start"] for s in edl["segments"]), 0.0, []
+    for a, b in sorted((b["at"], b["at"] + b["duration"]) for b in edl["broll"]):
+        trous.append((t, a))
+        t = max(t, b)
+    a, b = max(trous + [(t, total)], key=lambda g: g[1] - g[0])
+    rush = rf.measure_colour(video, a, b, n=3) if b - a >= 0.5 else None
+    out = []
+    for x in br:
+        m = rf.measure_colour(video, x["at"], x["at"] + x["duration"], n=3)
+        if m and rush and (m["luma"] < 0.12 or abs(m["temperature"] - rush["temperature"]) > 0.15):
+            out.append({"source": x.get("source") or x.get("plan"), "at": x["at"], "luma": m["luma"],
+                        "ecart_rb": round(m["temperature"] - rush["temperature"], 3)})
+    return out
+
+
+def agrandis(edl, root):
+    """Plans filmés affichés au-delà d'AGRANDI_MAX × leur définition (recadrage 9:16 × zoom, comme render, bandes
+    noires ignorées) : flous à l'écran. Inserts graphiques et carton exclus."""
+    import reframe as rf
+    from common import probe
+    fmt = (edl or {}).get("format") or {}
+    w, h = fmt.get("width", 1080), fmt.get("height", 1920)
+    out = []
+    for b in (edl or {}).get("broll") or []:
+        f = Path(root) / str(b.get("source", ""))
+        if b.get("texte") or b.get("carton") or not f.is_file():
+            continue
+        info = probe(f)
+        if not info.get("width"):
+            continue
+        bw, bh = (0.74 * w,) * 2 if b.get("vignette") else (w, h)
+        photo = f.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        z = b.get("zoom") or (1.10 if photo else 1.0)  # photo : lente poussée de render
+        if not photo:
+            z = rf.zoom_borne(info["width"], info["height"], bw, bh, z, isinstance(b.get("zoom_center"), list))
+        ag = rf.agrandissement(info["width"], info["height"], bw, bh, z, b.get("fond_flou"))
+        if ag > rf.AGRANDI_MAX + 0.01:
+            out.append({"source": b["source"], "at": b["at"], "agrandi": round(ag, 2)})
+    return out
 
 
 def dans_plage(profile, key, v, marge=0.05):
@@ -84,8 +180,9 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
     plan = m["duree_moyenne_plan_s"]
     if cible and abs(plan - cible) > 0.15 * cible and not dans_plage(profile, "duree_moyenne_plan_s", plan):
         besoin = round(m["duree"] / cible) - len(m["plans"])
-        conseil = (f"plans trop longs : ajouter ~{besoin} coupe(s) (couper plus serré, retirer respirations "
-                   f"et hésitations, ou alterner des punch-ins ×{z.get('intensite', 1.15)})"
+        # rythme = coupes sèches : le rendu fait les jump cuts (rythme.plan_max_s), un zoom en plus n'est pas un plan
+        conseil = (f"plans trop longs : ajouter ~{besoin} coupe(s) en coupes sèches SANS zoom (resserrer respirations "
+                   "et hésitations, puis relancer : le rendu découpe seul les phrases longues)"
                    if besoin > 0 else
                    f"plans trop courts : retirer ~{-besoin} coupe(s) (fusionner des segments voisins, moins de zooms)")
         ecart("duree_moyenne_plan_s", cible, plan, "±15%", conseil)
@@ -101,7 +198,8 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
                       + ("les plans les plus courts" if i == 1 else "les plans les plus longs")
                       + " (alterne court / long comme dans tes vidéos)")
     hp, mhp = r.get("hook_plan_s"), m.get("hook_plan_s")
-    if hp and mhp and abs(mhp - hp) > 0.3 * hp and not dans_plage(profile, "hook_plan_s", mhp):
+    # carton animé d'ouverture : ses animations comptent comme des coupes, la mesure de l'accroche n'a pas de sens
+    if hp and mhp and not e.get("carton") and abs(mhp - hp) > 0.3 * hp and not dans_plage(profile, "hook_plan_s", mhp):
         ecart("hook_plan_s", hp, mhp, "±30%",
               f"rythme de l'accroche (3 premières s) : un plan toutes les {fr(mhp)} s au lieu de {fr(hp)} s → "
               + ("ajouter une coupe ou un zoom dans les 3 premières secondes" if mhp > hp else
@@ -156,6 +254,12 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
                      if plus else "laisser plus d'air aux raccords (bornes moins serrées)")
                   + " ; le rendu recale sur rythme." + k)
 
+    deb, deb_ref = m.get("debit_mots_s"), r.get("debit_mots_s")
+    if deb and deb_ref and deb < 0.92 * deb_ref:
+        ecart("debit_mots_s", deb_ref, deb, "≥ 92 %",
+              f"parole trop lente ({fr(deb)} mots/s au lieu de {fr(deb_ref)}) : resserrer les silences internes "
+              "(le rendu le fait), puis retirer hésitations")
+
     lufs = profile.get("audio", {}).get("lufs_cible")
     if lufs is not None:
         if m["lufs"] is None:
@@ -177,6 +281,8 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
               f"remplacer {', '.join(map(str, e['plans_meme_scene']))} par un plan d'une autre scène (plans.md)")
 
     zpm = z.get("par_minute")
+    if (e.get("zooms_par_minute") or 0) > m["zooms_par_minute"]:
+        m["zooms_par_minute"] = e["zooms_par_minute"]
     # voix off : les zooms de la DA sont des zooms sur le visage, sans objet sur des plans d'illustration
     if not voix_off and zpm is not None and (zpm > 0 or m["zooms_par_minute"] > 2):
         if abs(m["zooms_par_minute"] - zpm) > max(0.35 * zpm, 1.0):
@@ -215,7 +321,9 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
                                                             "ajouter des mots_cles sur les mots forts"))
 
     b = profile.get("broll", {})
-    part = m.get("broll_part") if m.get("broll_part") is not None else e.get("broll_part")
+    # l'image rate des b-roll (visages dans une foule) : l'edl rendu donne le compte exact, on garde le plus grand
+    parts = [x for x in (m.get("broll_part"), e.get("broll_part")) if x is not None]
+    part = max(parts) if parts else None
     if not voix_off and b.get("part_pct") and b["part_pct"] >= 0.05 and part is not None and abs(part - b["part_pct"]) > 0.4 * b["part_pct"]:
         plus = part > b["part_pct"]
         ecart("broll_part", b["part_pct"], part, "±40%",
@@ -230,13 +338,17 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
     sfx_cible = profile.get("audio", {}).get("sfx_par_minute")
     # nos bruitages sont dans l'edl (compte exact) ; l'oreille du code ne sert que sans edl
     sfx_m = e.get("sfx_par_minute") if e.get("sfx_par_minute") is not None else m.get("sfx_par_minute")
-    # bruitages mesurés à l'oreille du code = estimation peu fiable : contrôlés seulement une fois confirmés (verrous)
-    sfx_ok = "audio.sfx_par_minute" in (profile.get("verrous") or [])
+    # profil récent (mesure hors parole et hors carton, clé sfx_carton présente) : fiable ; ancien : une fois confirmé
+    sfx_ok = "audio.sfx_par_minute" in (profile.get("verrous") or []) or         any("sfx_carton" in x for x in (profile.get("mesures_brutes") or {}).values())
+    if e.get("sans_bruitage"):  # STYLE.md : « pas de bruitage » (verrou de l'utilisateur)
+        sfx_ok = False
     if sfx_ok and sfx_cible and sfx_m is not None and abs(sfx_m - sfx_cible) > 0.5 * sfx_cible:
         ecart("sfx_par_minute", sfx_cible, sfx_m, "±50%",
               ("ajouter des bruitages sur les entrées de b-roll et les crash zooms" if sfx_m < sfx_cible else
                "retirer des bruitages : garder ceux des entrées de b-roll et des crash zooms")
-              + f" (types : {', '.join(profile['audio'].get('sfx_types') or ['whoosh'])})")
+              + f" (types : {', '.join(profile['audio'].get('sfx_types') or ['whoosh'])} ; compte hors carton"
+              + (f", l'oreille du code en entend {fr(m['sfx_par_minute'])}/min hors carton"
+                 if e.get("sfx_par_minute") is not None and m.get("sfx_par_minute") is not None else "") + ")")
 
     pc, mc = profile.get("couleur") or {}, m.get("couleur") or {}
     for k, mot in (("luma", ("sombre", "claire")), ("saturation", ("terne", "saturée"))):
@@ -244,6 +356,18 @@ def compare(m, profile, duree_cible=None, edl=None, e=None):
             ecart(f"couleur_{k}", pc[k], mc[k], "±0.08",
                   f"image trop {mot[0] if mc[k] < pc[k] else mot[1]} par rapport à tes vidéos : mettre "
                   "\"couleur\": \"auto\" dans edl.json (ou vérifier que la correction s'applique)")
+
+    if e.get("etalonnage"):
+        ecart("plan_hors_etalonnage", "luma ≥ 0,12, R−B à ±0,15 du rush",
+              [f"{x['source']} à {fr(x['at'], 1)} s (luma {fr(x['luma'])}, R−B {fr(x['ecart_rb'])})" for x in e["etalonnage"]],
+              "comme le rush", "plan hors étalonnage : trop sombre ou d'une autre couleur que le face caméra → "
+              "le remplacer par un plan plus clair / de même lumière, ou le raccourcir")
+
+    if e.get("agrandis"):
+        ecart("plan_agrandi", "≤ ×2 sa définition",
+              [f"{x['source']} à {fr(x['at'], 1)} s : plan agrandi ×{fr(x['agrandi'])} (flou)" for x in e["agrandis"]],
+              "≤ ×2", "plan filmé agrandi au-delà de sa définition : réduire son zoom, \"fond_flou\": true sur le "
+              "b-roll (plan entier sur fond flou) ou un plan plus défini")
 
     if e.get("mots_coupes"):
         ex = ", ".join(f"« {c['mot']} » à {fr(c['a_s'], 1)} s" for c in e["mots_coupes"][:4])
@@ -287,8 +411,15 @@ def main():
         print(f"Note : {rendu_path} concerne {Path(rendu['output']).name}, pas {video.name} : ignoré.")
         rendu = None
     e = edl_measures(rendu or edl, root, profile)
+    if e:
+        e["etalonnage"] = etalonnage(video, rendu or edl)
+        e["agrandis"] = agrandis(rendu or edl, root)
+    style = prof.with_name("STYLE.md")
+    e["sans_bruitage"] = style.is_file() and bool(SANS_BRUITAGE.search(style.read_text(encoding="utf-8")))
 
     m = measure.measure(video, e.get("words"))
+    if rendu or edl:
+        zooms_hors_bornes(m, rendu or edl)
     ecarts = compare(m, profile, args.duree_cible, edl or rendu, e)
     rapport = {"conforme": not ecarts, "ecarts": ecarts, "mesures": m,
                "edl": {k: v for k, v in e.items() if k != "words"}}

@@ -20,7 +20,7 @@ def test_cree_les_dossiers_et_compte(tmp_path):
     crees, contenu = doctor.preparer_dossiers(tmp_path)
     assert "rushs" not in crees and "mes-videos" in crees
     assert all((tmp_path / d).is_dir() for d in doctor.DOSSIERS)
-    assert contenu["rushs"] == 1 and contenu["sorties"] == 0
+    assert contenu["rushs"] == ("rushs", 1) and contenu["sorties"] == ("sorties", 0)
 
 
 def test_tout_pret(monkeypatch, tmp_path, capsys):
@@ -153,3 +153,25 @@ def test_sans_installer_ne_telecharge_rien(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(doctor, "telecharger_visage", lambda: (_ for _ in ()).throw(AssertionError))
     assert doctor.main(["--dossier", str(tmp_path)]) == 1
     assert capsys.readouterr().out.count("relancer avec --installer") >= 2
+
+
+def test_illustrations_libres_non_bloquant(monkeypatch, tmp_path, capsys):
+    _ok_env(monkeypatch)
+    for n in ("PEXELS_API_KEY", "PIXABAY_API_KEY"):
+        monkeypatch.delenv(n, raising=False)
+    monkeypatch.setattr(doctor, "CLES_ILLUSTRER", tmp_path / "absent.json")
+    assert doctor.main(["--dossier", str(tmp_path)]) == 0  # sans clé : prêt quand même
+    out = capsys.readouterr().out
+    assert "Wikimedia, NASA, Openverse" in out and "clé gratuite" in out
+    (tmp_path / "cles.json").write_text('{"pexels": "x"}', encoding="utf-8")
+    monkeypatch.setattr(doctor, "CLES_ILLUSTRER", tmp_path / "cles.json")
+    assert "+ Pexels" in doctor.etat_illustrations() and "clé gratuite" not in doctor.etat_illustrations()
+
+
+def test_ses_propres_dossiers_pas_de_dossiers_vides_en_plus(tmp_path):
+    (tmp_path / "A-Roll").mkdir()
+    (tmp_path / "A-Roll" / "a.mov").write_bytes(b"x")
+    (tmp_path / "B-Roll").mkdir()
+    crees, contenu = doctor.preparer_dossiers(tmp_path)
+    assert crees == [] and not (tmp_path / "rushs").exists()
+    assert contenu["rushs"] == ("A-Roll", 1) and contenu["broll"] == ("B-Roll", 0)  # ses noms, comme illustrer.py

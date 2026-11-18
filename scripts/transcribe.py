@@ -1,6 +1,7 @@
 """Rushs → transcripts JSON (mots horodatés + silences) et .monteur/takes.md."""
 import argparse
 import difflib
+import gc
 import json
 import os
 import re
@@ -13,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import VIDEO_EXT, die, ffmpeg, list_videos, probe, run, whisper_model_path, work_dir  # noqa: E402
+from common import ECONOME, VIDEO_EXT, die, ffmpeg, list_videos, probe, run, whisper_model_path, work_dir  # noqa: E402
 from pacing import FILLER_PAUSE, is_filler  # noqa: E402
 
 SILENCE_MIN = 0.3   # trou entre mots compté comme silence
@@ -22,9 +23,22 @@ LOW_CONF = 0.5
 AUDIO_EXT = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
 # Whisper efface les « euh » ; un prompt qui en contient l'incite à les écrire (technique connue)
 FILLER_PROMPT = "Euh, alors, hum, bah... euh, voilà."
-CACHE_VERSION = 2  # v2 : hésitations marquées, bords de mots recalés sur l'énergie
+CACHE_VERSION = 3  # v3 : passages dérivés en anglais repris avec Whisper
 PARAKEET = "parakeet-tdt-0.6b-v3"
 # langues de Parakeet TDT 0.6B v3 (carte du modèle) ; ailleurs → Whisper
+# Parakeet devine la langue seul : sur un accent, il bascule par passages en anglais inventé (mesuré : « the
+# dialogue series » pour du français). Trop de mots-outils anglais dans une autre langue → Whisper, langue forcée.
+ANGLAIS = set("the and is you that of it's i've they with have been this are can will your what".split())
+DERIVE_MAX = 0.03
+
+
+def derive_anglais(words, langue):
+    if langue in ("en", "auto") or not words:
+        return 0.0
+    mots = norm(words)
+    return sum(m in ANGLAIS for m in mots) / max(len(mots), 1)
+
+
 PARAKEET_LANGS = set("bg hr cs da nl en et fi fr de el hu it lv lt mt pl pt ro sk sl es sv ru uk auto".split())
 
 
@@ -32,8 +46,13 @@ def load_parakeet():
     """Modèle Parakeet + VAD Silero (onnx-asr), téléchargés une seule fois dans ~/.cache/monteur (dossiers simples :
     pas de liens symboliques, WinError 1314). Sert aussi à doctor.py pour tout pré-télécharger."""
     import onnx_asr
+    import onnxruntime as ort
     cache = Path.home() / ".cache" / "monteur"
-    asr = onnx_asr.load_model("nemo-" + PARAKEET, path=cache / PARAKEET, quantization="int8")
+    so = ort.SessionOptions()
+    if ECONOME:  # peu de mémoire libre : pas de réserve mémoire onnxruntime, 2 fils
+        so.enable_cpu_mem_arena = False
+        so.intra_op_num_threads = 2
+    asr = onnx_asr.load_model("nemo-" + PARAKEET, path=cache / PARAKEET, quantization="int8", sess_options=so)
     vad = onnx_asr.load_vad("silero", path=cache / "silero-vad")
     return asr, vad
 
@@ -194,7 +213,7 @@ def transcribe(model, src, args, prompt):
                       "p": round(w.probability, 2)} for s in segs for w in (s.words or []) if w.word.strip()]
             lang = info.language
         detected = silencedetect(wav)
-    words = glue(words)
+    words = casse(glue(words))
     for a, b in zip(words, words[1:]):  # garde-fou : horodatage strictement croissant
         b["start"] = max(b["start"], a["end"])
         b["end"] = max(b["end"], b["start"])
@@ -265,12 +284,26 @@ def vad_fillers(words, audio, sr=16000):
     return sorted(words + extra, key=lambda w: w["start"])
 
 
+def casse(words):
+    """Parakeet met une majuscule après chaque pause (« Plein d'événements », « quand même Très ») : visible dans des
+    sous-titres en minuscules. On la retire au milieu d'une phrase si le mot existe aussi en minuscule dans le
+    transcript (un nom propre, lui, n'y est jamais : « Maurice », « Nikki » restent)."""
+    minus = {w["w"].strip(".,;:!?…") for w in words if w["w"][:1].islower()}
+    for a, b in zip(words, words[1:]):
+        m = b["w"].strip(".,;:!?…")
+        if m[:1].isupper() and not m.isupper() and not a["w"].rstrip().endswith((".", "?", "!", "…"))                 and m.lower() in minus:
+            b["w"] = b["w"][0].lower() + b["w"][1:]
+    return words
+
+
 def glue(words):
-    """Whisper coupe « C » + « 'est », « abonne » + « -toi » : on recolle en un mot (début du 1er, fin du 2e)."""
+    """Whisper coupe « C » + « 'est », « abonne » + « -toi », « 100 » + « % » : on recolle en un mot (début du 1er, fin du 2e)."""
     out = []
     for w in words:
         # pas à travers une pause : « j » + 1,6 s + « 'ai » est un « euh » mal entendu suivi de « j'ai »
-        if out and re.match(r"['’]|-\w", w["w"]) and w["start"] - out[-1]["end"] < 0.3:
+        # « 100 » + « % » : le symbole seul disparaîtrait des sous-titres
+        if out and (re.match(r"['’]|-\w", w["w"]) or re.fullmatch(r"[%€$]+[.,!?]*", w["w"])) \
+                and w["start"] - out[-1]["end"] < 0.3:
             prev = out[-1]
             out[-1] = {"w": prev["w"] + w["w"], "start": prev["start"], "end": max(prev["end"], w["end"]),
                        "p": max(prev["p"], w["p"])}  # le fragment seul a souvent une confiance basse
@@ -342,7 +375,7 @@ def main():
         mots = [l.strip() for l in Path(args.lexique).read_text(encoding="utf-8-sig").splitlines()]
         prompt = ", ".join(m for m in mots if m and not m.startswith("#")) or None
 
-    model = None
+    model = secours = None
     transcripts = []
     stems = [f.stem for f in files]
     for src in files:
@@ -350,15 +383,27 @@ def main():
         out, cache = tdir / f"{name}.json", tdir / f"{name}.cache"
         st = src.stat()
         key = {"mtime": st.st_mtime, "size": st.st_size, "model": args.model, "lexique": prompt, "v": CACHE_VERSION}
-        if out.exists() and cache.exists() and json.loads(cache.read_text(encoding="utf-8")) == key:
+        old = json.loads(cache.read_text(encoding="utf-8")) if out.exists() and cache.exists() else None
+        if old == key:
             print(f"{src.name} : déjà transcrit (cache)")
             transcripts.append(json.loads(out.read_text(encoding="utf-8")))
+            continue
+        if old and args.model == PARAKEET and {**old, "lexique": prompt} == key and prompt:
+            # Parakeet applique le lexique après coup : nouveau lexique = mêmes mots corrigés, sans recharger le modèle (1 Go)
+            t = json.loads(out.read_text(encoding="utf-8"))
+            apply_lexique(t["words"], prompt.split(", "))
+            out.write_text(dump(t), encoding="utf-8")
+            cache.write_text(json.dumps(key), encoding="utf-8")
+            print(f"{src.name} : lexique appliqué au transcript existant (sans retranscrire)")
+            transcripts.append(t)
             continue
         info = probe(src)
         if not info["has_audio"]:
             print(f"{src.name} : pas de piste audio, ignoré")
             continue
         if model is None and args.model == PARAKEET:
+            secours = None  # libère Whisper avant de recharger Parakeet
+            gc.collect()
             print(f"chargement du modèle {PARAKEET}…", flush=True)
             try:
                 model = Parakeet()
@@ -377,10 +422,23 @@ def main():
         print(f"{src.name} ({info['duration']:.1f} s) : transcription…", flush=True)
         t0 = time.time()
         words, lang = transcribe(model, src, args, prompt)
+        modele = args.model
+        d = derive_anglais(words, args.langue) if isinstance(model, Parakeet) else 0.0
+        if d > DERIVE_MAX:
+            print(f"  {round(100 * d)} % de mots anglais : la transcription a dérivé, reprise avec Whisper "
+                  f"(langue {args.langue}, ~3x plus lent)", flush=True)
+            if secours is None:
+                from faster_whisper import WhisperModel
+                model = None  # jamais deux modèles en mémoire (≈ 2-3 Go chacun) ; Parakeet rechargé au fichier suivant
+                gc.collect()
+                secours = WhisperModel(whisper_model_path("large-v3-turbo"), device="cpu", compute_type="int8",
+                                       cpu_threads=os.cpu_count() or 4)
+            words, lang = transcribe(secours, src, args, prompt)
+            modele = "large-v3-turbo"
         el = time.time() - t0
         print(f"  {len(words)} mots en {el:.1f} s (x{info['duration'] / max(el, 0.01):.1f} temps réel)", flush=True)
         t = {"source": rel(src, args.root), "duration": round(info["duration"], 2), "language": lang,
-             "model": args.model, "words": words, "silences": find_silences(words, info["duration"])}
+             "model": modele, "words": words, "silences": find_silences(words, info["duration"])}
         out.write_text(dump(t), encoding="utf-8")
         cache.write_text(json.dumps(key), encoding="utf-8")
         transcripts.append(t)

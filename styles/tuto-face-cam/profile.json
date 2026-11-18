@@ -1,0 +1,149 @@
+{
+  "rythme": {
+    "respiration_intra_s": 0.1,
+    "respiration_phrases_s": 0.22,
+    "coupe_avant_mot_s": 0.07,
+    "duree_moyenne_plan_s": 1.4,
+    "mediane_plan_s": 1.3,
+    "coupes_par_minute": 43,
+    "silence_max_s": 0.5,
+    "plans_quantiles": [
+      0.8,
+      1.0,
+      1.3,
+      1.8,
+      2.4
+    ],
+    "hook_plan_s": 1.5
+  },
+  "zooms": {
+    "par_minute": 8,
+    "intensite": 1.25,
+    "style": "punch",
+    "types": {
+      "punch": 0.5,
+      "doux": 0.5
+    },
+    "rampe_s": 0.3,
+    "sur_visage": true,
+    "une_coupe_sur": 4
+  },
+  "sous_titres": {
+    "actif": true,
+    "police": "Montserrat",
+    "gras": true,
+    "taille_pct_hauteur": 0.032,
+    "couleur": "#FFFFFF",
+    "couleur_mot_actif": "#38BDF8",
+    "contour": "#000000",
+    "epaisseur_contour": 6,
+    "position_y_pct": 0.72,
+    "mots_par_bloc": 3,
+    "majuscules": false,
+    "animation": "glisse",
+    "couleur_mot_cle": "#38BDF8",
+    "mots_cles_par_bloc": 1,
+    "mots_cles_part_blocs": 0.25,
+    "emojis_par_minute": 1,
+    "zone_sure": true,
+    "graisse": 600,
+    "emojis_style": "sur les étapes (1️⃣, ✅) et les erreurs (❌)"
+  },
+  "audio": {
+    "lufs_cible": -14.0,
+    "musique": true,
+    "musique_db_sous_voix": -24,
+    "musique_lufs": -38,
+    "sfx_par_minute": 3,
+    "sfx_types": [
+      "pop",
+      "click"
+    ],
+    "sfx_carton": null,
+    "voix_nettoyee": true
+  },
+  "broll": {
+    "part_pct": 0.25,
+    "duree_moy_s": 1.8,
+    "jamais_sur_hook": true,
+    "source": "captures",
+    "couvre": "phrase",
+    "usage": "gros plans du geste, captures d'écran, l'objet montré de près"
+  },
+  "hook": {
+    "duree_s": 2.5,
+    "type": "résultat",
+    "texte_a_l_ecran": true,
+    "formule": "montre le résultat d'abord (« voilà comment… en 3 étapes »), titre à l'écran"
+  },
+  "version": 2,
+  "origine": "style de depart",
+  "style_depart": "tuto-face-cam",
+  "references": [],
+  "format": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30
+  },
+  "references_atypiques": [],
+  "titres": {
+    "actif": true,
+    "style": "numéro et nom de l'étape en haut de l'image",
+    "quand": "à chaque nouvelle étape"
+  },
+  "transitions": [],
+  "graphismes": [
+    {
+      "type": "chiffre",
+      "quand": "le nombre d'étapes ou un chiffre clé",
+      "duree_s": 1.8,
+      "detail": "gros chiffre, nom de l'étape dessous",
+      "police": "Montserrat",
+      "graisse": 800,
+      "entree": "monte",
+      "duree_entree_s": 0.3,
+      "sortie": "coupe",
+      "sous_titres": false
+    },
+    {
+      "type": "liste",
+      "quand": "le récap des étapes à la fin",
+      "duree_s": 2.6,
+      "detail": "les étapes l'une sous l'autre sur elle assombrie",
+      "police": "Montserrat",
+      "graisse": 800,
+      "entree": "monte",
+      "duree_entree_s": 0.3,
+      "sombre_fond": 0.55,
+      "sortie": "coupe",
+      "sous_titres": false
+    }
+  ],
+  "a_completer_par_claude": [
+    "sous_titres.police",
+    "sous_titres.couleurs",
+    "sous_titres.mots_par_bloc",
+    "sous_titres.animation",
+    "sous_titres.emojis",
+    "zooms.style",
+    "hook",
+    "broll.usage",
+    "titres",
+    "transitions",
+    "style_verbal"
+  ],
+  "cadrage": {
+    "visage_largeur": 0.3,
+    "visage_y": 0.32
+  },
+  "style_verbal": {
+    "duree_typique_s": 50,
+    "formules_hook": [],
+    "structure": "résultat → étape 1, 2, 3 → récap → appel à l'action",
+    "cta": [
+      "Enregistre pour plus tard"
+    ],
+    "fin": "cta",
+    "registre": "tu"
+  }
+}
